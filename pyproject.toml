@@ -26,7 +26,8 @@ keywords = [
 ]
 dependencies = [
     "selectolax",
-    "eaf-base-api"
+    "eaf-base-api>=4.0.0",
+    "curl-cffi",
 ]
 
 classifiers = [

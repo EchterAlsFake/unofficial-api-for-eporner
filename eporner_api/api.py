@@ -8,53 +8,92 @@ import logging
 import asyncio
 import argparse
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from urllib.parse import urljoin
-from typing import AsyncGenerator
-from curl_cffi import Response, AsyncSession
+from typing import AsyncGenerator, ClassVar
+from curl_cffi import AsyncSession
 from selectolax.lexbor import LexborHTMLParser
 from base_api.modules.config import RuntimeConfig
-from base_api import BaseCore, BaseMedia, Helper, DownloadConfigRAW, ScrapeResult
+from base_api import (
+    BaseCore,
+    BaseMedia,
+    DownloadConfigRAW,
+    ErrorAction,
+    ErrorHandler,
+    ErrorMode,
+    Helper,
+    MediaLoadError,
+    MediaLoadErrors,
+    ResultOrder,
+    RetryPolicy,
+    ScrapeErrorContext,
+    ScrapeResult,
+    media_field,
+)
 from base_api.modules.static_functions import normalize_quality_value, choose_quality_from_list, str_to_bool
-from base_api.modules.errors import InvalidProxy, BotProtectionDetected, NetworkRequestError, UnknownError, ResourceGone
+from base_api.modules.errors import (
+    BotProtectionDetected,
+    HTTPStatusError,
+    InvalidProxy,
+    NetworkRequestError,
+    RequestRetriesExhausted,
+    ResourceGone,
+    UnknownError,
+)
 
 from eporner_api.modules.errors import (ProxyError, BotDetection, NotFound, NetworkError, UnknownNetworkError,
                                         DownloadFailed)
 
 from eporner_api.modules.consts import (extractor, ROOT_URL, API_SEARCH,
                                         API_VIDEO_ID, headers, extractor_json)
-from eporner_api.modules.type_hints import on_error_hint
 from eporner_api.modules.locals import Encoding, Category
 from eporner_api.modules.sorting import Order, LowQuality, Gay
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
+SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 
-async def on_error(url: str, error: Exception, attempt: int) -> bool:
-    logger.error(f"URL: {url}, ERROR: {error}, Attempt: {attempt}")
 
+def _is_resource_gone(error: BaseException) -> bool:
     if isinstance(error, ResourceGone):
-        return False
+        return True
+    if isinstance(error, MediaLoadError):
+        return _is_resource_gone(error.original_error)
+    if isinstance(error, MediaLoadErrors):
+        return any(_is_resource_gone(item) for item in error.errors)
+    return False
 
-    return True
+
+async def on_error(context: ScrapeErrorContext) -> ErrorAction:
+    logger.error(
+        "URL: %s, ERROR: %s, Attempt: %s/%s",
+        context.url,
+        context.error,
+        context.attempt,
+        context.max_attempts,
+    )
+
+    if _is_resource_gone(context.error):
+        return ErrorAction.SKIP
+
+    return ErrorAction.RETRY
 
 
-async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> str | None | dict:
-    # What should I do here?
+async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> str | dict:
     try:
-        content = await core.fetch(url)
-        if isinstance(content, str):
-            if get_json:
-                return json.loads(content, strict=False)
+        content = await core.fetch_text(url)
+        if get_json:
+            return json.loads(content, strict=False)
 
-            return content
+        return content
 
-        if isinstance(content, Response):
-            if content.status_code == 404:
-                raise NotFound(f"Server returned 404 for: {url}")
+    except HTTPStatusError as e:
+        if e.status_code == 404:
+            raise NotFound(f"Server returned 404 for: {url}") from e
+        raise NetworkError(str(e)) from e
 
-    except NetworkRequestError as e:
+    except (NetworkRequestError, RequestRetriesExhausted) as e:
         raise NetworkError(str(e)) from e
 
     except InvalidProxy as e:
@@ -72,74 +111,51 @@ class Video(BaseMedia):
     url: str
     core: BaseCore
     video_id: str | None = None
-    keywords: list | None = None
-    title: str | None = None
-    views: int | None = None
-    rate: str | None = None
-    publish_date: str | None = None
-    length_seconds: str | None = None
-    length_minutes: str | None = None
-    embed_url: str | None = None
-    thumbnail: str | None = None
-    rating_value: str | None = None
-    rating_count: str | None = None
-    parsed_urls: dict | None = None
-    description: str | None = None
-    encoding_format: str | None = None
-    is_family_friendly: str | None = None
-    thumbnails: list[str] | None = None
-    content_url: str | None = None
-    best_rating: str | None = None
-    worst_rating: str | None = None
-    authors_urls: list[str] | None = None
+    keywords: list | None = media_field("api")
+    title: str | None = media_field("api")
+    views: int | None = media_field("api")
+    rate: str | None = media_field("api")
+    publish_date: str | None = media_field("api")
+    length_seconds: str | None = media_field("api")
+    length_minutes: str | None = media_field("api")
+    embed_url: str | None = media_field("api")
+    thumbnail: str | None = media_field("api")
+    rating_value: str | None = media_field("html")
+    rating_count: str | None = media_field("html")
+    parsed_urls: dict | None = media_field("html")
+    description: str | None = media_field("html")
+    encoding_format: str | None = media_field("html")
+    is_family_friendly: str | None = media_field("html")
+    thumbnails: list[str] | None = media_field("api")
+    content_url: str | None = media_field("html")
+    best_rating: str | None = media_field("html")
+    worst_rating: str | None = media_field("html")
+    authors_urls: list[str] | None = media_field("html")
 
-    async def _perform_load(self, api: bool, html: bool, anything_else: bool):
-        self.video_id = None
-        match = re.search(r'video-([^/]+)', self.url)
+    loader_methods: ClassVar[dict[str, str]] = {
+        "api": "_load_api",
+        "html": "_load_html",
+    }
+
+    def __post_init__(self) -> None:
+        if self.video_id is not None:
+            return
+
+        match = re.search(r"video-([^/]+)", self.url)
         if match:
             self.video_id = match.group(1)
 
-        match_2 = re.search(r'hd-porn/(.*?)/', self.url)
-        if match_2:
-            self.video_id = match_2.group(1)
+        match = re.search(r"hd-porn/(.*?)/", self.url)
+        if match:
+            self.video_id = match.group(1)
 
-        setattr(self, "video_id", self.video_id)
-        tasks = []
-        keys = []
-
-        if api:
-            tasks.append(self._fetch_api())
-            keys.append("api")
-
-        if html:
-            tasks.append(self._fetch_html())
-            keys.append("html")
-
-        results = {}
-        if tasks:
-            payloads = await asyncio.gather(*tasks)
-            results = dict(zip(keys, payloads))
-
-        combined_data = {}
-        if "html" in results and results["html"]:
-            combined_data.update(results["html"])
-
-        if "api" in results and results["api"]:
-            combined_data.update(results["api"])
-
-        allowed_fields = {field.name for field in fields(self)}
-        for key, value in combined_data.items():
-            if key in allowed_fields:
-                setattr(self, key, value)
-
-    async def _fetch_api(self):
+    async def _load_api(self) -> dict[str, object]:
         url = f"{ROOT_URL}{API_VIDEO_ID}?id={self.video_id}&thumbsize=medium&format=json"
         json_content = await get_html_content(core=self.core, url=url)
         assert isinstance(json_content, str)
         return await asyncio.to_thread(self._extract_api, json_content)
 
-
-    async def _fetch_html(self):
+    async def _load_html(self) -> dict[str, object]:
         html_content = await get_html_content(core=self.core, url=self.url)
         assert isinstance(html_content, str)
         return await asyncio.to_thread(self._extract_html, html_content)
@@ -258,6 +274,7 @@ class Video(BaseMedia):
         raise ValueError("Couldn't find a URL to match, please report this!")
 
     async def download(self, configuration: DownloadConfigRAW, mode: Encoding | str, use_workaround: bool = True):
+        await self.load_fields("parsed_urls", "title")
         config = copy.deepcopy(configuration)
         quality = config.quality
         url = self.get_url_by_quality(quality=quality, mode=mode)
@@ -273,49 +290,45 @@ class Video(BaseMedia):
             raise DownloadFailed(str(e))
 
     async def get_authors(self, load_html: bool = True) -> AsyncGenerator[Pornstar, None]:
-        actors = self.authors_urls
+        actors = await self.get_field("authors_urls")
         for url in actors:
             star = Pornstar(url=url, core=self.core)
-            yield await star.load(html=load_html)
+            if load_html:
+                await star.load_sources("html")
+            yield star
 
 
 @dataclass(kw_only=True, slots=True)
 class Pornstar(BaseMedia):
     url: str
     core: BaseCore
-    subscribers: str | None = None
-    picture: str | None = None
-    name: str | None = None
-    photos_amount: str | None = None
-    video_amount: str | None = None
-    pornstar_rank: str | None = None
-    profile_views: str | None = None
-    video_views: str | None = None
-    photo_views: str | None = None
-    country: str | None = None
-    age: str | None = None
-    ethnicity: str | None = None
-    eye_color: str | None = None
-    hair_color: str | None = None
-    height: str | None = None
-    weight: str | None = None
-    cup: str | None = None
-    measurements: str | None = None
-    biography: str | None = None
-    aliases: list | None = None
+    subscribers: str | None = media_field("html")
+    picture: str | None = media_field("html")
+    name: str | None = media_field("html")
+    photos_amount: str | None = media_field("html")
+    video_amount: str | None = media_field("html")
+    pornstar_rank: str | None = media_field("html")
+    profile_views: str | None = media_field("html")
+    video_views: str | None = media_field("html")
+    photo_views: str | None = media_field("html")
+    country: str | None = media_field("html")
+    age: str | None = media_field("html")
+    ethnicity: str | None = media_field("html")
+    eye_color: str | None = media_field("html")
+    hair_color: str | None = media_field("html")
+    height: str | None = media_field("html")
+    weight: str | None = media_field("html")
+    cup: str | None = media_field("html")
+    measurements: str | None = media_field("html")
+    biography: str | None = media_field("html")
+    aliases: list | None = media_field("html")
 
-    async def _perform_load(self, api: bool, html: bool, anything_else: bool):
-        if html:
-            await asyncio.gather(self._fetch_html())
+    loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
 
-    async def _fetch_html(self):
+    async def _load_html(self) -> dict[str, object]:
         html_content = await get_html_content(url=self.url, core=self.core)
         assert isinstance(html_content, str)
-        data: dict = await asyncio.to_thread(self._extract_html, html_content)
-        allowed_fields = {field.name for field in fields(self)}
-        for key, value in data.items():
-            if key in allowed_fields:
-                setattr(self, key, value)
+        return await asyncio.to_thread(self._extract_html, html_content)
 
     @staticmethod
     def _extract_html(html_content: str) -> dict:
@@ -367,24 +380,48 @@ class Pornstar(BaseMedia):
             "aliases": aliases,
         }
 
-    async def videos(self, pages: int = 0, videos_concurrency: int | None = None, pages_concurrency: int | None = None,
-                         on_video_error: on_error_hint = on_error, on_page_error: on_error_hint = None,
-                     keep_original_order: bool = False, load_html: bool = False, load_api: bool = False) -> AsyncGenerator[ScrapeResult, None]:
-            if pages == 0:
-                video_amount = str(self.video_amount).replace(",", "")
-                pages = round(int(video_amount)) / 37 # One page contains 37 videos
+    async def videos(
+        self,
+        pages: int = 0,
+        videos_concurrency: int | None = None,
+        pages_concurrency: int | None = None,
+        on_video_error: ErrorHandler | None = on_error,
+        on_page_error: ErrorHandler | None = None,
+        keep_original_order: bool = False,
+        load_html: bool = False,
+        load_api: bool = False,
+    ) -> AsyncGenerator[ScrapeResult, None]:
+        if pages == 0:
+            video_amount = str(await self.get_field("video_amount")).replace(",", "")
+            pages = round(int(video_amount)) / 37 # One page contains 37 videos
 
-            videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-            pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-            assert videos_concurrency and pages_concurrency
-            helper = Helper(core=self.core, constructor=Video)
-            pages = round(pages) # Dont ask
-            url = self.url
-            page_urls = [urljoin(f"{url}/", str(page)) for page in range(1, pages + 1)]
-            async for scrape_result in helper.iterator(target_page_urls=page_urls, video_link_extractor=extractor, max_page_concurrency=pages_concurrency,
-                                     max_video_concurrency=videos_concurrency, keep_original_order=keep_original_order,
-                                     fetch_api=load_api, fetch_html=load_html,
-                                     on_video_error=on_video_error, on_page_error=on_page_error):
+        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
+        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
+        assert videos_concurrency and pages_concurrency
+        helper = Helper(core=self.core, constructor=Video)
+        pages = round(pages) # Dont ask
+        url = self.url
+        page_urls = [urljoin(f"{url}/", str(page)) for page in range(1, pages + 1)]
+        load_sources = tuple(
+            source
+            for source, enabled in (("api", load_api), ("html", load_html))
+            if enabled
+        )
+        stream = helper.iterator(
+            target_page_urls=page_urls,
+            item_extractor=extractor,
+            max_page_concurrency=pages_concurrency,
+            max_item_concurrency=videos_concurrency,
+            load_sources=load_sources,
+            order=(ResultOrder.ORIGINAL if keep_original_order else ResultOrder.COMPLETION),
+            page_error_mode=ErrorMode.SKIP,
+            page_retry=SCRAPE_RETRY_POLICY,
+            item_retry=SCRAPE_RETRY_POLICY,
+            item_error_handler=on_video_error,
+            page_error_handler=on_page_error,
+        )
+        async with stream:
+            async for scrape_result in stream:
                 yield scrape_result
 
 
@@ -399,14 +436,20 @@ class Client:
         """Returns the Video object for a given URL"""
         logger.info(f"Returning video object for: {url} HTML Scraping -> {load_html}")
         video = Video(url=url, core=self.core)
-        return await video.load(html=load_html, api=load_api)
+        load_sources = tuple(
+            source
+            for source, enabled in (("api", load_api), ("html", load_html))
+            if enabled
+        )
+        await video.load_sources(*load_sources)
+        return video
 
     async def search_videos(self, query: str, sorting_gay: str | Gay, sorting_order: str | Order,
                         sorting_low_quality: str | LowQuality, per_page: int, load_html: bool = True, pages: int = 2,
                         max_video_concurrency: int = 20,
                         max_page_concurrency: int = 2,
-                        on_page_error: on_error_hint = None,
-                        on_video_error: on_error_hint = on_error,
+                        on_page_error: ErrorHandler | None = None,
+                        on_video_error: ErrorHandler | None = on_error,
                         keep_original_order: bool = False, load_api: bool = False,
                         ) -> AsyncGenerator[ScrapeResult, None]:
         helper = Helper(core=self.core, constructor=Video)
@@ -415,16 +458,32 @@ class Client:
         assert max_video_concurrency and max_video_concurrency
 
         page_urls = [f"{ROOT_URL}{API_SEARCH}?query={query}&per_page={per_page}&%page={page}&thumbsize=medium&order={sorting_order}&gay={sorting_gay}&lq={sorting_low_quality}&format=json" for page in range(pages)]
-        async for scrape_result in helper.iterator(target_page_urls=page_urls, max_page_concurrency=max_page_concurrency,
-                                         max_video_concurrency=max_video_concurrency, on_video_error=on_video_error,
-                                         on_page_error=on_page_error, keep_original_order=keep_original_order,
-                                         video_link_extractor=extractor_json, fetch_html=load_html, fetch_api=load_api):
-            yield scrape_result
+        load_sources = tuple(
+            source
+            for source, enabled in (("api", load_api), ("html", load_html))
+            if enabled
+        )
+        stream = helper.iterator(
+            target_page_urls=page_urls,
+            item_extractor=extractor_json,
+            max_page_concurrency=max_page_concurrency,
+            max_item_concurrency=max_video_concurrency,
+            load_sources=load_sources,
+            order=(ResultOrder.ORIGINAL if keep_original_order else ResultOrder.COMPLETION),
+            page_error_mode=ErrorMode.SKIP,
+            page_retry=SCRAPE_RETRY_POLICY,
+            item_retry=SCRAPE_RETRY_POLICY,
+            item_error_handler=on_video_error,
+            page_error_handler=on_page_error,
+        )
+        async with stream:
+            async for scrape_result in stream:
+                yield scrape_result
 
 
     async def get_videos_by_category(self, category: str | Category,
                                videos_concurrency: int | None = None, pages_concurrency: int | None = None,
-                                     on_video_error: on_error_hint = on_error, on_page_error: on_error_hint = None,
+                                     on_video_error: ErrorHandler | None = on_error, on_page_error: ErrorHandler | None = None,
                                      load_html: bool = False, load_api: bool = False,
                                      keep_original_order: bool = False) -> AsyncGenerator[ScrapeResult, None]:
 
@@ -434,17 +493,35 @@ class Client:
         pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
         assert videos_concurrency and pages_concurrency
         helper = Helper(core=self.core, constructor=Video)
-        async for scrape_result in helper.iterator(target_page_urls=page_urls, max_video_concurrency=videos_concurrency,
-                                 max_page_concurrency=pages_concurrency, video_link_extractor=extractor,
-                                 on_video_error=on_video_error, on_page_error=on_page_error,
-                                 keep_original_order=keep_original_order, fetch_html=load_html, fetch_api=load_api):
-            yield scrape_result
+        load_sources = tuple(
+            source
+            for source, enabled in (("api", load_api), ("html", load_html))
+            if enabled
+        )
+        stream = helper.iterator(
+            target_page_urls=page_urls,
+            item_extractor=extractor,
+            max_page_concurrency=pages_concurrency,
+            max_item_concurrency=videos_concurrency,
+            load_sources=load_sources,
+            order=(ResultOrder.ORIGINAL if keep_original_order else ResultOrder.COMPLETION),
+            page_error_mode=ErrorMode.SKIP,
+            page_retry=SCRAPE_RETRY_POLICY,
+            item_retry=SCRAPE_RETRY_POLICY,
+            item_error_handler=on_video_error,
+            page_error_handler=on_page_error,
+        )
+        async with stream:
+            async for scrape_result in stream:
+                yield scrape_result
 
 
     async def get_pornstar(self, url: str, load_html: bool = True) -> Pornstar:
         logger.info(f"Returning Pornstar object for: {url} HTML Scraping -> {load_html}")
         pornstar = Pornstar(url=url, core=self.core)
-        return await pornstar.load(html=load_html)
+        if load_html:
+            await pornstar.load_sources("html")
+        return pornstar
 
 
 async def run_main():

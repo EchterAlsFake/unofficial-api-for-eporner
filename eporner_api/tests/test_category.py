@@ -17,19 +17,22 @@ async def test_category():
     async for result in videos_1:
         if idx == 3:
             break
-        assert isinstance(result.video.title, str) and len(result.video.title) > 0
+        video = result.unwrap()
+        assert isinstance(video.title, str) and len(video.title) > 0
         idx += 1
 
     idx = 0
     async for result in videos_2:
         if idx == 3:
             break
-        assert isinstance(result.video.title, str) and len(result.video.title) > 0
+        video = result.unwrap()
+        assert isinstance(video.title, str) and len(video.title) > 0
         idx += 1
 
     idx = 0
     async for result in videos_3:
         if idx == 3:
             break
-        assert isinstance(result.video.title, str) and len(result.video.title) > 0
+        video = result.unwrap()
+        assert isinstance(video.title, str) and len(video.title) > 0
         idx += 1

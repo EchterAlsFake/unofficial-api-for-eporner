@@ -15,7 +15,8 @@ async def test_pornstar():
     
     idx = 0
     async for result in videos:
-        assert isinstance(result.video.title, str) and len(result.video.title) > 3
+        video = result.unwrap()
+        assert isinstance(video.title, str) and len(video.title) > 3
         idx += 1
         if idx == 5:
             break

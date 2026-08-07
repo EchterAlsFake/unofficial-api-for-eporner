@@ -28,6 +28,8 @@ def extractor(content: str) -> list[dict]:
         title_node = node.css_first("p.mbtit a")
         url = title_node.attributes.get("href") if title_node else None
         title = title_node.text(strip=True) if title_node else None
+        if not isinstance(url, str) or not url:
+            continue
 
         # 2. Thumbnail Processing (Handles lazy-loaded images safely)
         img_node = node.css_first("div.mbimg img")
@@ -81,8 +83,8 @@ def extractor(content: str) -> list[dict]:
             if author_href:
                 authors_urls = [author_href]
 
-        # Structure payload matching your Video dataclass keys
-        videos_data.append({
+        # Unknown author data stays omitted so BaseMedia can load it from HTML.
+        video_data = {
             "url": url,
             "video_id": video_id,
             "title": title,
@@ -92,18 +94,22 @@ def extractor(content: str) -> list[dict]:
             "length_minutes": length_minutes,
             "thumbnail": thumbnail,
             "thumbnails": thumbnails,
-            "authors_urls": authors_urls
-        })
+        }
+        if authors_urls is not None:
+            video_data["authors_urls"] = authors_urls
+        videos_data.append(video_data)
 
     return videos_data
 
 
-def extractor_json(content: str) -> list[str]:
+def extractor_json(content: str) -> list[dict]:
     videos = []
     stuff = json.loads(content)
 
     for video in stuff.get("videos", []):  # Don't know why this works lmao
         url = video.get("url")
+        if not isinstance(url, str) or not url:
+            continue
         video_id = video.get("video_id")
         title = video.get("title")
         keywords = video.get("keywords")
