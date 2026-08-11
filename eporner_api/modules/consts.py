@@ -85,7 +85,7 @@ def extractor(content: str) -> list[dict]:
 
         # Unknown author data stays omitted so BaseMedia can load it from HTML.
         video_data = {
-            "url": url,
+            "url": f"https://eporner.com{url}",
             "video_id": video_id,
             "title": title,
             "views": views,

@@ -56,16 +56,16 @@ SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 def make_iterator_config() -> IteratorConfig:
     return IteratorConfig(
         load_specific_sources=("api", "html"),
-        item_retry=SCRAPE_RETRY_POLICY,
-        page_retry=SCRAPE_RETRY_POLICY,
+        item_retry=None,
+        page_retry=None,
         page_error_mode=ErrorMode.SKIP,
-        item_error_handler=None,
-        page_error_handler=None,
+        item_error_handler=on_error,
+        page_error_handler=on_error,
     )
 
 
 def _is_resource_gone(error: BaseException) -> bool:
-    if isinstance(error, ResourceGone):
+    if isinstance(error, (ResourceGone, NotFound)):
         return True
     if isinstance(error, MediaLoadError):
         return _is_resource_gone(error.original_error)
@@ -159,7 +159,7 @@ class Video(BaseMedia):
             self.video_id = match.group(1)
 
     async def _load_api(self) -> dict[str, object]:
-        url = f"{ROOT_URL}{API_VIDEO_ID}?id={self.video_id}&thumbsize=medium&format=json"
+        url = f"https://eporner.com/api/v2/video/id/?id={self.video_id}&thumbsize=medium&format=json"
         json_content = await get_html_content(core=self.core, url=url)
         assert isinstance(json_content, str)
         return await asyncio.to_thread(self._extract_api, json_content)
@@ -172,6 +172,12 @@ class Video(BaseMedia):
     @staticmethod
     def _extract_api(json_content: str) -> dict:
         json_data = json.loads(json_content, strict=False)
+        
+        if isinstance(json_data, list):
+            if not json_data:
+                raise ResourceGone("Video not found via API")
+            json_data = json_data[0]
+
         title = json_data.get("title", "")
         keywords = json_data.get("keywords", "").split(",")
         views = json_data.get("views", None)
@@ -393,7 +399,7 @@ class Pornstar(BaseMedia):
         self,
         pages: int = 0,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         if pages == 0:
             video_amount = str(await self.get_field("video_amount")).replace(",", "")
             pages = round(int(video_amount)) / 37 # One page contains 37 videos
@@ -444,7 +450,7 @@ class Client:
         per_page: int,
         pages: int = 2,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         helper = Helper(core=self.core, constructor=Video)
 
         page_urls = [f"{ROOT_URL}{API_SEARCH}?query={query}&per_page={per_page}&%page={page}&thumbsize=medium&order={sorting_order}&gay={sorting_gay}&lq={sorting_low_quality}&format=json" for page in range(pages)]
@@ -466,7 +472,7 @@ class Client:
         self,
         category: str | Category,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
 
         page_urls = [f"{ROOT_URL}cat/{category}/{page}" for page in range(1, 100)]
 
