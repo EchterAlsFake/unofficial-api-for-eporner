@@ -140,6 +140,9 @@ class Video(BaseMedia):
     best_rating: str | None = media_field("html")
     worst_rating: str | None = media_field("html")
     authors_urls: list[str] | None = media_field("html")
+    tags: list[str] | None = media_field("html")
+    categories: list[str] | None = media_field("html")
+    uploader: str | None = media_field("html")
 
     loader_methods: ClassVar[dict[str, str]] = {
         "api": "_load_api",
@@ -217,6 +220,10 @@ class Video(BaseMedia):
         best_rating = json_html.get("aggregateRating", {}).get("bestRating", "")
         worst_rating = json_html.get("aggregateRating", {}).get("worstRating", "")
         content_url = json_html.get("contentUrl", "")
+        uploader = lexbor.css_first("li.vit-uploader").text(strip=True)
+
+        categories = [category.text(strip=True) for category in lexbor.css("li.vit-category")]
+        tags = [tag.text(strip=True) for tag in lexbor.css("li.vit-tag")]
 
         authors_urls = []
         actors = json_html.get("actor", {})
@@ -269,15 +276,18 @@ class Video(BaseMedia):
             "rating_count": rating_count,
             "content_url": content_url,
             "parsed_urls": parsed_urls,
-            "authors_urls": authors_urls
+            "authors_urls": authors_urls,
+            "categories": categories,
+            "tags": tags,
+            "uploader": uploader
         }
 
-    def get_available_qualities(self) -> list[str]:
+    def video_qualities(self) -> list[str]:
         # I assume here that the available qualities aren't different per mdoe (hopefully)
         return [k for k, v in self.parsed_urls.items()]
 
     def get_url_by_quality(self, quality: str | int, mode: Encoding | str) -> str:
-        available_qualities = self.get_available_qualities()
+        available_qualities = self.video_qualities()
         qn = normalize_quality_value(quality)
         quality_to_choose = choose_quality_from_list(available=available_qualities, target=qn)
 
@@ -361,16 +371,31 @@ class Pornstar(BaseMedia):
         country = lexbor.css_first("div.psbio.ps2").css_first("div.cllnumber").text(strip=True)
         age = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[1].text(strip=True)
         ethnicity = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[2].text(strip=True)
-        eye_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[3].text(strip=True)
-        hair_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[4].text(strip=True)
-        height = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[5].text(strip=True)
-        weight = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[6].text(strip=True)
-        cup = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[7].text(strip=True)
-        measurements = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[8].text(strip=True)
+        try: eye_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[3].text(strip=True)
+        except (AttributeError, IndexError): eye_color = None
 
-        biography = lexbor.css_first("div.psscrol > p").text(strip=True)
-        stuff = lexbor.css_first("div.psbio.ps4")
-        aliases = [tag.text(strip=True) for tag in stuff.css("li")]
+        try: hair_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[4].text(strip=True)
+        except (AttributeError, IndexError): hair_color = None
+
+        try: height = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[5].text(strip=True)
+        except(AttributeError, IndexError): height = None
+
+        try: weight = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[6].text(strip=True)
+        except(AttributeError, IndexError): weight = None
+        try: cup = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[7].text(strip=True)
+        except (AttributeError, IndexError): cup = None
+
+        try: measurements = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[8].text(strip=True)
+        except (AttributeError, IndexError): measurements = None
+
+        try: biography = lexbor.css_first("div.psscrol > p").text(strip=True)
+        except AttributeError: biography = None
+
+        try:
+            stuff = lexbor.css_first("div.psbio.ps4")
+            aliases = [tag.text(strip=True) for tag in stuff.css("li")]
+        except AttributeError:
+            aliases = []
 
         return {
             "name": name,
