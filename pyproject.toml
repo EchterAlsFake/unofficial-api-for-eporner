@@ -64,3 +64,5 @@ eporner_api = "eporner_api.api:main"
 module-name = "eporner_api"
 module-root = ""
 
+[tool.uv.sources]
+eaf-base-api = { path = "../eaf_base_api", editable = true }

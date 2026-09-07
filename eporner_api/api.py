@@ -10,7 +10,7 @@ import argparse
 
 from dataclasses import dataclass
 from urllib.parse import urljoin
-from typing import AsyncGenerator, ClassVar
+from typing import AsyncGenerator, ClassVar, Any
 from curl_cffi import AsyncSession
 from selectolax.lexbor import LexborHTMLParser
 from base_api.modules.config import IteratorConfig, RuntimeConfig
@@ -27,8 +27,12 @@ from base_api import (
     ScrapeErrorContext,
     ScrapeResult,
     media_field,
+    is_resource_gone,
+    default_on_error,
+    scrape_stream,
+    make_iterator_config as _base_make_iterator_config,
 )
-from base_api.modules.static_functions import normalize_quality_value, choose_quality_from_list, str_to_bool
+from base_api.modules.static_functions import normalize_quality_value, choose_quality_from_list, str_to_bool, get_text_safe
 from base_api.modules.errors import (
     BotProtectionDetected,
     HTTPStatusError,
@@ -53,40 +57,33 @@ logger.addHandler(logging.NullHandler())
 SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 
 
-def make_iterator_config() -> IteratorConfig:
-    return IteratorConfig(
-        load_specific_sources=("api", "html"),
-        item_retry=None,
-        page_retry=None,
-        page_error_mode=ErrorMode.SKIP,
-        item_error_handler=on_error,
-        page_error_handler=on_error,
+def make_iterator_config(
+    load_specific_sources: tuple[str, ...] = ("api", "html"),
+    *,
+    max_item_concurrency: int | None = None,
+    max_page_concurrency: int | None = None,
+    item_retry: RetryPolicy | None = None,
+    page_retry: RetryPolicy | None = None,
+    page_error_mode: ErrorMode = ErrorMode.SKIP,
+    item_error_handler: Any = default_on_error,
+    page_error_handler: Any = default_on_error,
+    **kwargs,
+) -> IteratorConfig:
+    return _base_make_iterator_config(
+        load_specific_sources=load_specific_sources,
+        max_item_concurrency=max_item_concurrency,
+        max_page_concurrency=max_page_concurrency,
+        item_retry=item_retry,
+        page_retry=page_retry,
+        page_error_mode=page_error_mode,
+        item_error_handler=item_error_handler,
+        page_error_handler=page_error_handler,
+        **kwargs,
     )
 
 
-def _is_resource_gone(error: BaseException) -> bool:
-    if isinstance(error, (ResourceGone, NotFound)):
-        return True
-    if isinstance(error, MediaLoadError):
-        return _is_resource_gone(error.original_error)
-    if isinstance(error, MediaLoadErrors):
-        return any(_is_resource_gone(item) for item in error.errors)
-    return False
-
-
-async def on_error(context: ScrapeErrorContext) -> ErrorAction:
-    logger.error(
-        "URL: %s, ERROR: %s, Attempt: %s/%s",
-        context.url,
-        context.error,
-        context.attempt,
-        context.max_attempts,
-    )
-
-    if _is_resource_gone(context.error):
-        return ErrorAction.SKIP
-
-    return ErrorAction.RETRY
+_is_resource_gone = is_resource_gone
+on_error = default_on_error
 
 
 async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> str | dict:
@@ -220,7 +217,7 @@ class Video(BaseMedia):
         best_rating = json_html.get("aggregateRating", {}).get("bestRating", "")
         worst_rating = json_html.get("aggregateRating", {}).get("worstRating", "")
         content_url = json_html.get("contentUrl", "")
-        uploader = lexbor.css_first("li.vit-uploader").text(strip=True)
+        uploader = get_text_safe(lexbor.css_first("li.vit-uploader"))
 
         categories = [category.text(strip=True) for category in lexbor.css("li.vit-category")]
         tags = [tag.text(strip=True) for tag in lexbor.css("li.vit-tag")]
@@ -448,7 +445,9 @@ class Pornstar(BaseMedia):
 
 
 class Client:
-    def __init__(self, core: BaseCore = BaseCore(RuntimeConfig())):
+    def __init__(self, core: BaseCore | None = None):
+        if core is None:
+            core = BaseCore(RuntimeConfig())
         self.core = core
         self.core.initialize_session()
         assert isinstance(self.core.session, AsyncSession)
@@ -466,7 +465,7 @@ class Client:
         await video.load_sources(*load_sources)
         return video
 
-    async def search_videos(
+    def search_videos(
         self,
         query: str,
         sorting_gay: str | Gay,
@@ -476,44 +475,37 @@ class Client:
         pages: int = 2,
         iterator_config: IteratorConfig | None = None,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
-        helper = Helper(core=self.core, constructor=Video)
-
         page_urls = [f"{ROOT_URL}{API_SEARCH}?query={query}&per_page={per_page}&%page={page}&thumbsize=medium&order={sorting_order}&gay={sorting_gay}&lq={sorting_low_quality}&format=json" for page in range(pages)]
 
         if iterator_config is None:
             iterator_config = make_iterator_config()
 
-        stream = helper.iterator(
+        return scrape_stream(
+            core=self.core,
+            constructor=Video,
             target_page_urls=page_urls,
             item_extractor=extractor_json,
             iterator_config=iterator_config,
         )
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
 
 
-    async def get_videos_by_category(
+    def get_videos_by_category(
         self,
         category: str | Category,
         iterator_config: IteratorConfig | None = None,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
-
         page_urls = [f"{ROOT_URL}cat/{category}/{page}" for page in range(1, 100)]
-
-        helper = Helper(core=self.core, constructor=Video)
 
         if iterator_config is None:
             iterator_config = make_iterator_config()
 
-        stream = helper.iterator(
+        return scrape_stream(
+            core=self.core,
+            constructor=Video,
             target_page_urls=page_urls,
             item_extractor=extractor,
             iterator_config=iterator_config,
         )
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
 
 
     async def get_pornstar(self, url: str, load_html: bool = True) -> Pornstar:
@@ -524,60 +516,86 @@ class Client:
         return pornstar
 
 
-async def run_main():
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich_argparse import RichHelpFormatter
-    
-    console = Console()
-    console.print(Panel.fit("[bold magenta]EPorner API CLI[/bold magenta]", border_style="cyan"))
-
+def create_parser(formatter_class=None) -> argparse.ArgumentParser:
+    kwargs = {}
+    if formatter_class:
+        kwargs["formatter_class"] = formatter_class
     parser = argparse.ArgumentParser(
-        description="API Command Line Interface",
-        formatter_class=RichHelpFormatter
+        description="EPorner API Command Line Interface",
+        **kwargs
     )
     parser.add_argument("--download", metavar="URL", type=str, help="URL to download from")
-    parser.add_argument("--quality", metavar="best|half|worst", type=str, help="The video quality (best, half, worst)",
-                        required=True)
+    parser.add_argument("--quality", metavar="best|half|worst", type=str, default="best",
+                        help="The video quality (best, half, worst)")
     parser.add_argument("--file", metavar="FILE", type=str,
                         help="(Optional) Specify a file with URLs (separated with new lines)")
-    parser.add_argument("--output", metavar="DIR", type=str, help="The output path (with filename)",
+    parser.add_argument("--output", metavar="DIR", type=str, help="The output path (with filename or directory)",
                         required=True)
-    parser.add_argument("--no-title", metavar="True|False", type=str,
-                        help="Whether to apply video title automatically to output path or not", required=True)
+    parser.add_argument("--no-title", metavar="True,False", type=str, nargs="?", const="True", default="False",
+                        help="Whether to apply video title automatically to output path or not")
+    return parser
 
-    args = parser.parse_args()
-    no_title = str_to_bool(args.no_title)
+
+async def run_main(args_list: list[str] | None = None):
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich_argparse import RichHelpFormatter
+        console = Console()
+        console.print(Panel.fit("[bold magenta]EPorner API CLI[/bold magenta]", border_style="cyan"))
+        formatter_class = RichHelpFormatter
+    except ImportError:
+        console = None
+        formatter_class = None
+
+    parser = create_parser(formatter_class=formatter_class)
+    args = parser.parse_args(args_list)
+    no_title = str_to_bool(args.no_title) if isinstance(args.no_title, str) else bool(args.no_title)
     config = DownloadConfigRAW(quality=args.quality, path=args.output, no_title=no_title)
 
+    urls: list[str] = []
     if args.download:
-        client = Client()
-        console.print(f"[cyan]Fetching video information for:[/cyan] [yellow]{args.download}[/yellow]")
-        video = await client.get_video(args.download, load_html=True)
-        console.print(f"[green]Starting download for:[/green] [bold]{video.title}[/bold]")
-        await video.download(config, mode=Encoding.mp4_h264)
-        console.print("[bold green]Download complete![/bold green]")
-
+        urls.append(args.download)
     if args.file:
-        client = Client()
-
         with open(args.file, "r") as file:
-            content = [line.strip() for line in file.readlines() if line.strip()]
+            urls.extend([line.strip() for line in file.readlines() if line.strip()])
 
-        console.print(f"[cyan]Fetching information for {len(content)} videos concurrently...[/cyan]")
-        
-        fetch_tasks = [client.get_video(url, load_html=True) for url in content]
-        videos = await asyncio.gather(*fetch_tasks)
+    if not urls:
+        parser.print_help()
+        return
 
-        console.print(f"[cyan]Downloading {len(videos)} videos concurrently...[/cyan]")
-        
-        download_tasks = [video.download(config, mode=Encoding.mp4_h264) for video in videos]
-        await asyncio.gather(*download_tasks)
-        
-        console.print("[bold green]All downloads complete![/bold green]")
+    client = Client()
+    for url in urls:
+        if console:
+            console.print(f"[cyan]Fetching video information for:[/cyan] [yellow]{url}[/yellow]")
+        else:
+            print(f"Fetching video information for: {url}")
+        try:
+            video = await client.get_video(url, load_html=True)
+            title = getattr(video, "title", None) or url
+            if console:
+                console.print(f"[green]Starting download for:[/green] [bold]{title}[/bold]")
+            else:
+                print(f"Starting download for: {title}")
+            await video.download(config, mode=Encoding.mp4_h264)
+            if console:
+                console.print(f"[bold green]Download complete: {title}![/bold green]")
+            else:
+                print(f"Download complete: {title}")
+        except Exception as e:
+            if console:
+                console.print(f"[bold red]Error downloading {url}:[/bold red] {e}")
+            else:
+                print(f"Error downloading {url}: {e}")
+
 
 def main():
-    asyncio.run(run_main())
+    try:
+        asyncio.run(run_main())
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
+
 
 if __name__ == "__main__":
     main()
+
