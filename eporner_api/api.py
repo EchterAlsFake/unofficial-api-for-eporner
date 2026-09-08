@@ -8,6 +8,8 @@ import logging
 import asyncio
 import argparse
 
+from base_api.modules.logger import configure_app_logging
+
 from dataclasses import dataclass
 from urllib.parse import urljoin
 from typing import AsyncGenerator, ClassVar, Any
@@ -34,6 +36,7 @@ from base_api import (
 )
 from base_api.modules.static_functions import normalize_quality_value, choose_quality_from_list, str_to_bool, get_text_safe
 from base_api.modules.errors import (
+    DownloadCancelled,
     BotProtectionDetected,
     HTTPStatusError,
     InvalidProxy,
@@ -95,21 +98,30 @@ async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> 
         return content
 
     except HTTPStatusError as e:
+        logger.exception("Request failed for %s: %s", url, e)
         if e.status_code == 404:
             raise NotFound(f"Server returned 404 for: {url}") from e
-        raise NetworkError(str(e)) from e
+        raise NetworkError(f"Request failed for {url}: {e}") from e
 
     except (NetworkRequestError, RequestRetriesExhausted) as e:
-        raise NetworkError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise NetworkError(f"Request failed for {url}: {e}") from e
 
     except InvalidProxy as e:
-        raise ProxyError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise ProxyError(f"Request failed for {url}: {e}") from e
 
     except BotProtectionDetected as e:
-        raise BotDetection(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise BotDetection(f"Request failed for {url}: {e}") from e
 
     except UnknownError as e:
-        raise UnknownNetworkError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise UnknownNetworkError(f"Request failed for {url}: {e}") from e
+
+    except Exception:
+        logger.exception("Failed to fetch or decode response for %s", url)
+        raise
 
 
 @dataclass(slots=True, kw_only=True)
@@ -175,7 +187,7 @@ class Video(BaseMedia):
         
         if isinstance(json_data, list):
             if not json_data:
-                raise ResourceGone("Video not found via API")
+                raise ResourceGone(f"Video not found via API: {self.url}")
             json_data = json_data[0]
 
         title = json_data.get("title", "")
@@ -293,23 +305,25 @@ class Video(BaseMedia):
             if str(quality_to_choose) == stuff:
                 return key.get(mode)
 
-        raise ValueError("Couldn't find a URL to match, please report this!")
+        raise ValueError(f"No download URL for {self.url}: quality={quality!r}, encoding={mode!r}, available={available_qualities}")
 
     async def download(self, configuration: DownloadConfigRAW, mode: Encoding | str, use_workaround: bool = True):
-        await self.load_fields("parsed_urls", "title")
-        config = copy.deepcopy(configuration)
-        quality = config.quality
-        url = self.get_url_by_quality(quality=quality, mode=mode)
-
-        if not config.no_title:
-            config.path = os.path.join(config.path, f"{self.title}.mp4")
-
         try:
+            await self.load_fields("parsed_urls", "title")
+            config = copy.deepcopy(configuration)
+            quality = config.quality
+            url = self.get_url_by_quality(quality=quality, mode=mode)
+
+            if not config.no_title:
+                config.path = os.path.join(config.path, f"{self.title}.mp4")
+
             await self.core.legacy_download(url=url, configuration=config)
             return True
-
+        except DownloadCancelled:
+            raise
         except Exception as e:
-            raise DownloadFailed(str(e))
+            logger.exception("Download failed for %s: %s", self.url, e)
+            raise DownloadFailed(f"Download failed for {self.url}: {e}") from e
 
     async def get_authors(self, load_html: bool = True) -> AsyncGenerator[Pornstar, None]:
         actors = await self.get_field("authors_urls")
@@ -583,6 +597,7 @@ async def run_main(args_list: list[str] | None = None):
             else:
                 print(f"Download complete: {title}")
         except Exception as e:
+            logger.exception("CLI failed while processing %s", url)
             if console:
                 console.print(f"[bold red]Error downloading {url}:[/bold red] {e}")
             else:
@@ -590,6 +605,7 @@ async def run_main(args_list: list[str] | None = None):
 
 
 def main():
+    configure_app_logging(level=logging.INFO)
     try:
         asyncio.run(run_main())
     except KeyboardInterrupt:
@@ -598,4 +614,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
