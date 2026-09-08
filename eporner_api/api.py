@@ -218,7 +218,15 @@ class Video(BaseMedia):
     def _extract_html(html_content: str) -> dict:
         lexbor = LexborHTMLParser(html_content)
 
+        if (
+            lexbor.css_first("#deletedfile") is not None
+            or lexbor.css_first(".hdpnotfound") is not None
+        ):
+            raise ResourceGone("Video is no longer available")
+
         script = lexbor.css_first("script[type='application/ld+json']")
+        if script is None:
+            raise ValueError("Video metadata was not found in the page")
         json_html = json.loads(script.text(), strict=False)
 
         encoding_format = json_html.get("encodingFormat", "")
