@@ -31,6 +31,10 @@ def extractor(content: str) -> list[dict]:
         if not isinstance(url, str) or not url:
             continue
 
+        match_id = re.search(r"(?:video-|hd-porn/)([^/]+)", url)
+        if match_id:
+            video_id = match_id.group(1)
+
         # 2. Thumbnail Processing (Handles lazy-loaded images safely)
         img_node = node.css_first("div.mbimg img")
         thumbnail = None

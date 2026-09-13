@@ -123,28 +123,29 @@ async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> 
         logger.exception("Failed to fetch or decode response for %s", url)
         raise
 
-
 @dataclass(slots=True, kw_only=True)
 class Video(BaseMedia):
     url: str
     core: BaseCore
     video_id: str | None = None
-    keywords: list | None = media_field("api")
-    title: str | None = media_field("api")
-    views: int | None = media_field("api")
+
+    keywords: list[str] | None = media_field("api")
+    title: str | None = media_field("api", "html")
+    views: int | None = media_field("api", "html")
     rate: str | None = media_field("api")
     publish_date: str | None = media_field("api")
-    length_seconds: str | None = media_field("api")
+    length_seconds: int | None = media_field("api")
     length_minutes: str | None = media_field("api")
-    embed_url: str | None = media_field("api")
-    thumbnail: str | None = media_field("api")
+    embed_url: str | None = media_field("api", "html")
+    thumbnail: str | None = media_field("api", "html")
+    thumbnails: list[str] | None = media_field("api", "html")
+
     rating_value: str | None = media_field("html")
     rating_count: str | None = media_field("html")
     parsed_urls: dict | None = media_field("html")
     description: str | None = media_field("html")
     encoding_format: str | None = media_field("html")
     is_family_friendly: str | None = media_field("html")
-    thumbnails: list[str] | None = media_field("api")
     content_url: str | None = media_field("html")
     best_rating: str | None = media_field("html")
     worst_rating: str | None = media_field("html")
@@ -162,16 +163,15 @@ class Video(BaseMedia):
         if self.video_id is not None:
             return
 
-        match = re.search(r"video-([^/]+)", self.url)
-        if match:
-            self.video_id = match.group(1)
-
-        match = re.search(r"hd-porn/(.*?)/", self.url)
+        match = re.search(r"(?:video-|hd-porn/)([^/]+)", self.url)
         if match:
             self.video_id = match.group(1)
 
     async def _load_api(self) -> dict[str, object]:
-        url = f"https://eporner.com/api/v2/video/id/?id={self.video_id}&thumbsize=medium&format=json"
+        url = (
+            "https://eporner.com/api/v2/video/id/"
+            f"?id={self.video_id}&thumbsize=medium&format=json"
+        )
         json_content = await get_html_content(core=self.core, url=url)
         assert isinstance(json_content, str)
         return await asyncio.to_thread(self._extract_api, json_content)
@@ -181,41 +181,38 @@ class Video(BaseMedia):
         assert isinstance(html_content, str)
         return await asyncio.to_thread(self._extract_html, html_content)
 
-    @staticmethod
-    def _extract_api(json_content: str) -> dict:
+    def _extract_api(self, json_content: str) -> dict[str, object]:
         json_data = json.loads(json_content, strict=False)
-        
+
         if isinstance(json_data, list):
             if not json_data:
                 raise ResourceGone(f"Video not found via API: {self.url}")
             json_data = json_data[0]
 
-        title = json_data.get("title", "")
-        keywords = json_data.get("keywords", "").split(",")
-        views = json_data.get("views", None)
-        rate = json_data.get("rate", "")
-        publish_date = json_data.get("added", "")
-        length_seconds = json_data.get("length_sec", "")
-        length_minutes = json_data.get("length_min", "")
-        embed_url = json_data.get("embed", "")
-        thumbnail = json_data.get("default_thumb", {}).get("src", "")
-        thumbnails = json_data.get("thumbs", [])
+        keywords = json_data.get("keywords")
 
         return {
-            "title": title,
-            "keywords": keywords,
-            "views": views,
-            "rate": rate,
-            "publish_date": publish_date,
-            "length_seconds": length_seconds,
-            "length_minutes": length_minutes,
-            "embed_url": embed_url,
-            "thumbnail": thumbnail,
-            "thumbnails": thumbnails
+            "title": json_data.get("title"),
+            "keywords": (
+                [keyword.strip() for keyword in keywords.split(",")]
+                if keywords else []
+            ),
+            "views": json_data.get("views"),
+            "rate": json_data.get("rate"),
+            "publish_date": json_data.get("added"),
+            "length_seconds": json_data.get("length_sec"),
+            "length_minutes": json_data.get("length_min"),
+            "embed_url": json_data.get("embed"),
+            "thumbnail": json_data.get("default_thumb", {}).get("src"),
+            "thumbnails": [
+                thumb["src"]
+                for thumb in json_data.get("thumbs", [])
+                if thumb.get("src")
+            ],
         }
 
     @staticmethod
-    def _extract_html(html_content: str) -> dict:
+    def _extract_html(html_content: str) -> dict[str, object]:
         lexbor = LexborHTMLParser(html_content)
 
         if (
@@ -224,136 +221,224 @@ class Video(BaseMedia):
         ):
             raise ResourceGone("Video is no longer available")
 
-        script = lexbor.css_first("script[type='application/ld+json']")
-        if script is None:
+        json_html = None
+
+        for script in lexbor.css("script[type='application/ld+json']"):
+            data = json.loads(script.text(), strict=False)
+            if data.get("@type") == "VideoObject":
+                json_html = data
+                break
+
+        if json_html is None:
             raise ValueError("Video metadata was not found in the page")
-        json_html = json.loads(script.text(), strict=False)
 
-        encoding_format = json_html.get("encodingFormat", "")
-        is_family_friendly = json_html.get("isFamilyFriendly", "")
-        description = json_html.get("description", "")
-        rating_value = json_html.get("aggregateRating", {}).get("ratingValue", "")
-        rating_count = json_html.get("aggregateRating", {}).get("ratingCount", "")
-        best_rating = json_html.get("aggregateRating", {}).get("bestRating", "")
-        worst_rating = json_html.get("aggregateRating", {}).get("worstRating", "")
-        content_url = json_html.get("contentUrl", "")
-        uploader = get_text_safe(lexbor.css_first("li.vit-uploader"))
+        rating = json_html.get("aggregateRating", {})
 
-        categories = [category.text(strip=True) for category in lexbor.css("li.vit-category")]
-        tags = [tag.text(strip=True) for tag in lexbor.css("li.vit-tag")]
+        categories = [
+            node.text(strip=True)
+            for node in lexbor.css("li.vit-category")
+        ]
+        tags = [
+            node.text(strip=True)
+            for node in lexbor.css("li.vit-tag")
+        ]
 
-        authors_urls = []
-        actors = json_html.get("actor", {})
-        for actor in actors:
-            authors_urls.append(actor.get("url"))
+        authors_urls = [
+            actor["url"]
+            for actor in json_html.get("actor", [])
+            if actor.get("url")
+        ]
 
-        # Temporary storage to hold raw integer qualities and their corresponding URLs
         raw_data = {}
 
-        # 1. Parse AV1 URLs
-        for node in lexbor.css('span.download-av1 a'):
-            href = node.attributes.get('href')
-            if href:
-                # Extract the resolution number (e.g., '240' from '240p' or '/240/')
-                match = re.search(r'(\d+)p', href)
-                if match:
-                    quality = int(match.group(1))
-                    if quality not in raw_data:
-                        raw_data[quality] = {}
-                    raw_data[quality]['av1'] = f"https://www.eporner.com{href}"
+        for mode in ("av1", "h264"):
+            for node in lexbor.css(f"span.download-{mode} a"):
+                href = node.attributes.get("href")
+                if not href:
+                    continue
 
-        # 2. Parse H.264 URLs
-        for node in lexbor.css('span.download-h264 a'):
-            href = node.attributes.get('href')
-            if href:
-                match = re.search(r'(\d+)p', href)
-                if match:
-                    quality = int(match.group(1))
-                    if quality not in raw_data:
-                        raw_data[quality] = {}
-                    raw_data[quality]['h264'] = f"https://www.eporner.com{href}"
+                match = re.search(r"(\d+)p", href)
+                if not match:
+                    continue
 
-        # 3. Sort by quality (worst to best / ascending order) and build the final dict
-        sorted_qualities = sorted(raw_data.keys())
+                quality = int(match.group(1))
+                raw_data.setdefault(quality, {})[mode] = (
+                    f"https://www.eporner.com{href}"
+                )
 
-        parsed_urls = {}
-        for q in sorted_qualities:
-            parsed_urls[f"{q}p"] = {
-                "av1": raw_data[q].get("av1"),
-                "h264": raw_data[q].get("h264")
+        parsed_urls = {
+            f"{quality}p": {
+                "av1": urls.get("av1"),
+                "h264": urls.get("h264"),
             }
+            for quality, urls in sorted(raw_data.items())
+        }
+
+        thumbnails = json_html.get("thumbnailUrl", [])
 
         return {
-            "encoding_format": encoding_format,
-            "is_family_friendly": is_family_friendly,
-            "description": description,
-            "rating_value": rating_value,
-            "best_rating": best_rating,
-            "worst_rating": worst_rating,
-            "rating_count": rating_count,
-            "content_url": content_url,
+            "title": json_html.get("name"),
+            "views": json_html.get(
+                "interactionStatistic", {}
+            ).get("userInteractionCount"),
+            "embed_url": json_html.get("embedUrl"),
+            "thumbnail": json_html.get("image"),
+            "thumbnails": thumbnails,
+            "encoding_format": json_html.get("encodingFormat"),
+            "is_family_friendly": json_html.get("isFamilyFriendly"),
+            "description": json_html.get("description"),
+            "rating_value": rating.get("ratingValue"),
+            "rating_count": rating.get("ratingCount"),
+            "best_rating": rating.get("bestRating"),
+            "worst_rating": rating.get("worstRating"),
+            "content_url": json_html.get("contentUrl"),
             "parsed_urls": parsed_urls,
             "authors_urls": authors_urls,
             "categories": categories,
             "tags": tags,
-            "uploader": uploader
+            "uploader": get_text_safe(
+                lexbor.css_first("li.vit-uploader")
+            ),
         }
 
     def video_qualities(self) -> list[str]:
-        # I assume here that the available qualities aren't different per mdoe (hopefully)
-        return [k for k, v in self.parsed_urls.items()]
+        return list(self.parsed_urls)
 
-    def get_url_by_quality(self, quality: str | int, mode: Encoding | str) -> str:
-        available_qualities = self.video_qualities()
-        qn = normalize_quality_value(quality)
-        quality_to_choose = choose_quality_from_list(available=available_qualities, target=qn)
+    def get_url_by_quality(
+        self,
+        quality: str | int,
+        mode: Encoding | str,
+    ) -> str:
+        available = self.video_qualities()
+        quality = choose_quality_from_list(
+            available=available,
+            target=normalize_quality_value(quality),
+        )
 
-        for stuff, key in self.parsed_urls.items():
-            stuff = stuff.lower().strip("p")
-            if str(quality_to_choose) == stuff:
-                return key.get(mode)
+        if isinstance(mode, Encoding):
+            mode = mode.value
 
-        raise ValueError(f"No download URL for {self.url}: quality={quality!r}, encoding={mode!r}, available={available_qualities}")
+        url = self.parsed_urls[f"{quality}p"].get(mode)
+        if url:
+            return url
 
-    async def download(self, configuration: DownloadConfigRAW, mode: Encoding | str, use_workaround: bool = True):
+        raise ValueError(
+            f"No download URL for {self.url}: "
+            f"quality={quality!r}, encoding={mode!r}, "
+            f"available={available}"
+        )
+
+    async def download(
+        self,
+        configuration: DownloadConfigRAW,
+        mode: Encoding | str,
+    ):
         try:
             await self.load_fields("parsed_urls", "title")
+
             config = copy.deepcopy(configuration)
-            quality = config.quality
-            url = self.get_url_by_quality(quality=quality, mode=mode)
+            url = self.get_url_by_quality(
+                quality=config.quality,
+                mode=mode,
+            )
 
             if not config.no_title:
-                config.path = os.path.join(config.path, f"{self.title}.mp4")
+                config.path = os.path.join(
+                    config.path,
+                    f"{self.title}.mp4",
+                )
 
-            await self.core.legacy_download(url=url, configuration=config)
+            await self.core.legacy_download(
+                url=url,
+                configuration=config,
+            )
             return True
+
         except DownloadCancelled:
             raise
         except Exception as e:
-            logger.exception("Download failed for %s: %s", self.url, e)
-            raise DownloadFailed(f"Download failed for {self.url}: {e}") from e
+            logger.exception(
+                "Download failed for %s: %s",
+                self.url,
+                e,
+            )
+            raise DownloadFailed(
+                f"Download failed for {self.url}: {e}"
+            ) from e
 
-    async def get_authors(self, load_html: bool = True) -> AsyncGenerator[Pornstar, None]:
+    async def get_authors(
+        self,
+        load_html: bool = True,
+    ) -> AsyncGenerator[Pornstar, None]:
         actors = await self.get_field("authors_urls")
+
         for url in actors:
             star = Pornstar(url=url, core=self.core)
+
             if load_html:
                 await star.load_sources("html")
+
             yield star
 
 
 @dataclass(kw_only=True, slots=True)
-class Pornstar(BaseMedia):
-    url: str
+class BaseProfile(BaseMedia):
     core: BaseCore
-    subscribers: str | None = media_field("html")
-    picture: str | None = media_field("html")
     name: str | None = media_field("html")
-    photos_amount: str | None = media_field("html")
+    subscribers: str | None = media_field("html")
     video_amount: str | None = media_field("html")
+    video_views: str | None = media_field("html")
+    picture: str | None = media_field("html")
+    websites: dict[str, str] | None = media_field("html")
+
+    loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
+
+    async def _load_html(self) -> dict[str, object]:
+        html_content = await get_html_content(url=self.url, core=self.core)
+        assert isinstance(html_content, str)
+        return await asyncio.to_thread(self._extract_html, html_content)
+
+    @staticmethod
+    def _extract_html(html_content: str) -> dict[str, object]:
+        raise NotImplementedError
+
+    async def videos(
+        self,
+        pages: int = 0,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
+        if pages == 0:
+            raw_video_amount = await self.get_field("video_amount")
+            try:
+                cleaned_amount = int(str(raw_video_amount or "0").replace(",", ""))
+                pages = max(1, (cleaned_amount + 36) // 37)  # One page contains 37 videos
+            except (ValueError, TypeError):
+                pages = 1
+
+        helper = Helper(core=self.core, constructor=Video)
+        pages = round(pages)
+        url = self.url
+        page_urls = [urljoin(f"{url}/", str(page)) for page in range(1, pages + 1)]
+
+        if iterator_config is None:
+            iterator_config = make_iterator_config()
+
+        stream = helper.iterator(
+            target_page_urls=page_urls,
+            item_extractor=extractor,
+            iterator_config=iterator_config,
+        )
+        async with stream:
+            async for scrape_result in stream:
+                yield scrape_result
+
+
+@dataclass(kw_only=True, slots=True)
+class Pornstar(BaseProfile):
+    pornstar_id: str | None = media_field("html")
+    photos_amount: str | None = media_field("html")
     pornstar_rank: str | None = media_field("html")
     profile_views: str | None = media_field("html")
-    video_views: str | None = media_field("html")
     photo_views: str | None = media_field("html")
     country: str | None = media_field("html")
     age: str | None = media_field("html")
@@ -365,59 +450,107 @@ class Pornstar(BaseMedia):
     cup: str | None = media_field("html")
     measurements: str | None = media_field("html")
     biography: str | None = media_field("html")
-    aliases: list | None = media_field("html")
-
-    loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
-
-    async def _load_html(self) -> dict[str, object]:
-        html_content = await get_html_content(url=self.url, core=self.core)
-        assert isinstance(html_content, str)
-        return await asyncio.to_thread(self._extract_html, html_content)
+    aliases: list[str] | None = media_field("html")
 
     @staticmethod
-    def _extract_html(html_content: str) -> dict:
+    def _extract_html(html_content: str) -> dict[str, object]:
         lexbor = LexborHTMLParser(html_content)
 
-        name = lexbor.css_first("h1").text(strip=True)
-        subscribers = lexbor.css_first("div#resppssubcnt").text(strip=True)
-        picture = lexbor.css_first("div.psImgOuter").css_first("img").attributes.get("src")
-        photos_amount = lexbor.css_first("div.ps1a").css_first("a").css_first("span").text(strip=True)
-        video_amount = lexbor.css_first("div.ps1a").css("a")[1].css_first("span").text(strip=True)
-        pornstar_rank = lexbor.css_first("div.psbio.ps3").css_first("div").css_first("span").text(strip=True)
-        profile_views = lexbor.css_first("div.psbio.ps3 > div:nth-child(2) > span").text(strip=True)
-        video_views = lexbor.css_first("div.psbio.ps3").css("div")[2].css_first("span").text(strip=True)
-        photo_views = lexbor.css_first("div.psbio.ps3").css("div")[3].css_first("span").text(strip=True)
-        country = lexbor.css_first("div.psbio.ps2").css_first("div.cllnumber").text(strip=True)
-        age = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[1].text(strip=True)
-        ethnicity = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[2].text(strip=True)
-        try: eye_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[3].text(strip=True)
-        except (AttributeError, IndexError): eye_color = None
+        h1 = lexbor.css_first("h1")
+        name = h1.text(strip=True) if h1 else None
 
-        try: hair_color = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[4].text(strip=True)
-        except (AttributeError, IndexError): hair_color = None
+        img = lexbor.css_first("div.psImgOuter img")
+        picture = img.attributes.get("src") if img else None
 
-        try: height = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[5].text(strip=True)
-        except(AttributeError, IndexError): height = None
+        sub_btn = lexbor.css_first("div.subscribebutton")
+        onclick = sub_btn.attributes.get("onclick", "") if sub_btn else ""
+        match_id = re.search(r"EP\.subscribe\.sub\(this,\s*(\d+)", onclick)
+        if not match_id:
+            match_id = re.search(r"EP\.subscribe\.sub\(this,\s*(\d+)", html_content)
+        pornstar_id = match_id.group(1) if match_id else None
 
-        try: weight = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[6].text(strip=True)
-        except(AttributeError, IndexError): weight = None
-        try: cup = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[7].text(strip=True)
-        except (AttributeError, IndexError): cup = None
+        video_amount = None
+        photos_amount = None
+        for a in lexbor.css("div.ps1a a"):
+            span = a.css_first("span")
+            val = span.text(strip=True) if span else None
+            text = a.text(strip=True).lower()
+            href = a.attributes.get("href", "").lower()
+            if "video" in text or ("#toptopbel" in href and "photo" not in href):
+                video_amount = val
+            elif "photo" in text or "photo" in href:
+                photos_amount = val
 
-        try: measurements = lexbor.css_first("div.psbio.ps2").css("div.cllnumber")[8].text(strip=True)
-        except (AttributeError, IndexError): measurements = None
+        pornstar_rank = None
+        profile_views = None
+        video_views = None
+        photo_views = None
+        subscribers = None
 
-        try: biography = lexbor.css_first("div.psscrol > p").text(strip=True)
-        except AttributeError: biography = None
+        ps3 = lexbor.css_first("div.psbio.ps3")
+        if ps3:
+            for d in ps3.css("div"):
+                text = d.text(strip=True).lower()
+                span = d.css_first("span")
+                val = span.text(strip=True) if span else None
+                if "rank:" in text:
+                    pornstar_rank = val
+                elif "profile views:" in text:
+                    profile_views = val
+                elif "video views:" in text:
+                    video_views = val
+                elif "photo views:" in text:
+                    photo_views = val
+                elif "subscribers:" in text:
+                    subscribers = val
 
-        try:
-            stuff = lexbor.css_first("div.psbio.ps4")
-            aliases = [tag.text(strip=True) for tag in stuff.css("li")]
-        except AttributeError:
-            aliases = []
+        if subscribers is None:
+            sub_cnt = lexbor.css_first("div#resppssubcnt span")
+            if sub_cnt:
+                subscribers = sub_cnt.text(strip=True)
+            elif sub_btn:
+                small = sub_btn.css_first("small")
+                if small:
+                    subscribers = small.text(strip=True).strip("()")
+
+        ps2_map = {}
+        ps2 = lexbor.css_first("div.psbio.ps2")
+        if ps2:
+            for li in ps2.css("li"):
+                label_node = li.css_first("span")
+                val_node = li.css_first("div.cllnumber")
+                if label_node and val_node:
+                    ps2_map[label_node.text(strip=True).rstrip(":").lower()] = val_node.text(strip=True)
+
+        country = ps2_map.get("country")
+        age = ps2_map.get("age")
+        ethnicity = ps2_map.get("ethnicity")
+        eye_color = ps2_map.get("eye")
+        hair_color = ps2_map.get("hair")
+        height = ps2_map.get("height")
+        weight = ps2_map.get("weight")
+        cup = ps2_map.get("cup")
+        measurements = ps2_map.get("measurements")
+
+        ps4 = lexbor.css_first("div.psbio.ps4")
+        aliases = [tag.text(strip=True) for tag in ps4.css("li")] if ps4 else []
+
+        websites = {}
+        ps5 = lexbor.css_first("div.psbio.ps5")
+        if ps5:
+            for a in ps5.css("a"):
+                href = a.attributes.get("href")
+                if href:
+                    label = a.text(strip=True) or "Website"
+                    websites[label] = href
+
+        ps6 = lexbor.css_first("div.psbio.ps6")
+        p_node = ps6.css_first("p") if ps6 else None
+        biography = p_node.text(strip=True) if p_node else None
 
         return {
             "name": name,
+            "pornstar_id": pornstar_id,
             "subscribers": subscribers,
             "picture": picture,
             "photos_amount": photos_amount,
@@ -437,33 +570,112 @@ class Pornstar(BaseMedia):
             "measurements": measurements,
             "biography": biography,
             "aliases": aliases,
+            "websites": websites,
         }
 
-    async def videos(
-        self,
-        pages: int = 0,
-        iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult[Video], None]:
-        if pages == 0:
-            video_amount = str(await self.get_field("video_amount")).replace(",", "")
-            pages = round(int(video_amount)) / 37 # One page contains 37 videos
 
-        helper = Helper(core=self.core, constructor=Video)
-        pages = round(pages) # Dont ask
-        url = self.url
-        page_urls = [urljoin(f"{url}/", str(page)) for page in range(1, pages + 1)]
+@dataclass(kw_only=True, slots=True)
+class Channel(BaseProfile):
+    channel_id: str | None = media_field("html")
+    channel_rank: str | None = media_field("html")
+    logo: str | None = media_field("html")
+    banner: str | None = media_field("html")
 
-        if iterator_config is None:
-            iterator_config = make_iterator_config()
+    @staticmethod
+    def _extract_html(html_content: str) -> dict[str, object]:
+        lexbor = LexborHTMLParser(html_content)
 
-        stream = helper.iterator(
-            target_page_urls=page_urls,
-            item_extractor=extractor,
-            iterator_config=iterator_config,
-        )
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        h1 = lexbor.css_first("div#pprofiletopinfo h1")
+        if not h1:
+            h1 = lexbor.css_first("h1")
+        name = h1.text(strip=True) if h1 else None
+
+        img = lexbor.css_first("img.chlogo")
+        if not img:
+            img = lexbor.css_first("div#pprofiletophead img")
+        logo = img.attributes.get("src") if img else None
+        picture = logo
+
+        banner = None
+        top = lexbor.css_first("div#pprofiletop")
+        if top:
+            style = top.attributes.get("style", "")
+            match_banner = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
+            if match_banner:
+                banner = match_banner.group(1)
+
+        sub_btn = lexbor.css_first("div.subscribebutton")
+        onclick = sub_btn.attributes.get("onclick", "") if sub_btn else ""
+        match_id = re.search(r"EP\.subscribe\.sub\(this,\s*(\d+)", onclick)
+        if not match_id:
+            match_id = re.search(r"EP\.subscribe\.sub\(this,\s*(\d+)", html_content)
+        channel_id = match_id.group(1) if match_id else None
+
+        subscribers = None
+        video_amount = None
+        video_views = None
+        channel_rank = None
+
+        topbtn = lexbor.css_first("div#pprofiletopbtn")
+        if topbtn:
+            for d in topbtn.css("div"):
+                span = d.css_first("span")
+                val = span.text(strip=True) if span else None
+                text = d.text(strip=True).lower()
+                if "subscriber" in text:
+                    subscribers = val
+                elif "video" in text and "view" not in text:
+                    video_amount = val
+                elif "view" in text:
+                    video_views = val
+                elif "rank" in text:
+                    channel_rank = val
+
+        if subscribers is None and sub_btn:
+            span = sub_btn.css_first("span.sbview1")
+            if span:
+                subscribers = span.text(strip=True)
+            else:
+                small = sub_btn.css_first("small")
+                if small:
+                    subscribers = small.text(strip=True).strip("()")
+
+        websites: dict[str, str] = {}
+        for a in lexbor.css("div.channelsoc a"):
+            href = a.attributes.get("href")
+            if not href:
+                continue
+            label = a.text(strip=True)
+            if not label:
+                i_tag = a.css_first("i")
+                if i_tag:
+                    classes = i_tag.attributes.get("class", "").split()
+                    for cls in classes:
+                        if cls.startswith("fa-"):
+                            label = cls.replace("fa-", "").replace("-square", "").capitalize()
+                            break
+            if not label:
+                label = "Website"
+            if label not in websites:
+                websites[label] = href
+            elif websites[label] != href:
+                counter = 2
+                while f"{label} {counter}" in websites:
+                    counter += 1
+                websites[f"{label} {counter}"] = href
+
+        return {
+            "name": name,
+            "channel_id": channel_id,
+            "subscribers": subscribers,
+            "picture": picture,
+            "logo": logo,
+            "banner": banner,
+            "video_amount": video_amount,
+            "video_views": video_views,
+            "channel_rank": channel_rank,
+            "websites": websites,
+        }
 
 
 class Client:
@@ -536,6 +748,13 @@ class Client:
         if load_html:
             await pornstar.load_sources("html")
         return pornstar
+
+    async def get_channel(self, url: str, load_html: bool = True) -> Channel:
+        logger.info(f"Returning Channel object for: {url} HTML Scraping -> {load_html}")
+        channel = Channel(url=url, core=self.core)
+        if load_html:
+            await channel.load_sources("html")
+        return channel
 
 
 def create_parser(formatter_class=None) -> argparse.ArgumentParser:

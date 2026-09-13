@@ -63,3 +63,6 @@ eporner_api = "eporner_api.api:main"
 [tool.uv.build-backend]
 module-name = "eporner_api"
 module-root = ""
+
+[tool.uv.sources]
+eaf-base-api = { path = "../eaf_base_api" }
