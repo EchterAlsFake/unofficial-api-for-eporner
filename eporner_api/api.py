@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import re
-import os
-import copy
 import json
 import logging
 import asyncio
 import argparse
 
-from base_api.modules.logger import configure_app_logging
+from eporner_api.modules import errors as provider_errors
+from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
+from base_api.modules.logger import configure_app_logging, get_logger
 
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -35,16 +35,7 @@ from base_api import (
     make_iterator_config as _base_make_iterator_config,
 )
 from base_api.modules.static_functions import normalize_quality_value, choose_quality_from_list, str_to_bool, get_text_safe
-from base_api.modules.errors import (
-    DownloadCancelled,
-    BotProtectionDetected,
-    HTTPStatusError,
-    InvalidProxy,
-    NetworkRequestError,
-    RequestRetriesExhausted,
-    ResourceGone,
-    UnknownError,
-)
+from base_api.modules.errors import ResourceGone
 
 from eporner_api.modules.errors import (ProxyError, BotDetection, NotFound, NetworkError, UnknownNetworkError,
                                         DownloadFailed)
@@ -54,8 +45,7 @@ from eporner_api.modules.consts import (extractor, ROOT_URL, API_SEARCH,
 from eporner_api.modules.locals import Encoding, Category
 from eporner_api.modules.sorting import Order, LowQuality, Gay
 
-logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
+logger = get_logger(__name__)
 
 SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 
@@ -89,39 +79,9 @@ _is_resource_gone = is_resource_gone
 on_error = default_on_error
 
 
-async def get_html_content(core: BaseCore, url: str, get_json: bool = False) -> str | dict:
-    try:
-        content = await core.fetch_text(url)
-        if get_json:
-            return json.loads(content, strict=False)
-
-        return content
-
-    except HTTPStatusError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        if e.status_code == 404:
-            raise NotFound(f"Server returned 404 for: {url}") from e
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-
-    except (NetworkRequestError, RequestRetriesExhausted) as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-
-    except InvalidProxy as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise ProxyError(f"Request failed for {url}: {e}") from e
-
-    except BotProtectionDetected as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise BotDetection(f"Request failed for {url}: {e}") from e
-
-    except UnknownError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise UnknownNetworkError(f"Request failed for {url}: {e}") from e
-
-    except Exception:
-        logger.exception("Failed to fetch or decode response for %s", url)
-        raise
+async def get_html_content(core: BaseCore, url: str, get_json: bool = False, *, owner=None) -> str | dict:
+    return await fetch_content(core, url, logger=logger, owner=owner,
+                               error_types=provider_errors, get_json=get_json)
 
 @dataclass(slots=True, kw_only=True)
 class Video(BaseMedia):
@@ -172,12 +132,12 @@ class Video(BaseMedia):
             "https://eporner.com/api/v2/video/id/"
             f"?id={self.video_id}&thumbsize=medium&format=json"
         )
-        json_content = await get_html_content(core=self.core, url=url)
+        json_content = await get_html_content(core=self.core, url=url, owner=self)
         assert isinstance(json_content, str)
         return await asyncio.to_thread(self._extract_api, json_content)
 
     async def _load_html(self) -> dict[str, object]:
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         assert isinstance(html_content, str)
         return await asyncio.to_thread(self._extract_html, html_content)
 
@@ -328,43 +288,25 @@ class Video(BaseMedia):
             f"available={available}"
         )
 
+    @download_errors(DownloadFailed)
     async def download(
         self,
         configuration: DownloadConfigRAW,
         mode: Encoding | str,
     ):
-        try:
-            await self.load_fields("parsed_urls", "title")
+        await self.load_fields("parsed_urls", "title")
 
-            config = copy.deepcopy(configuration)
-            url = self.get_url_by_quality(
-                quality=config.quality,
-                mode=mode,
-            )
+        config = prepare_download_config(configuration, self.title)
+        url = self.get_url_by_quality(
+            quality=config.quality,
+            mode=mode,
+        )
 
-            if not config.no_title:
-                config.path = os.path.join(
-                    config.path,
-                    f"{self.title}.mp4",
-                )
 
-            await self.core.legacy_download(
-                url=url,
-                configuration=config,
-            )
-            return True
-
-        except DownloadCancelled:
-            raise
-        except Exception as e:
-            logger.exception(
-                "Download failed for %s: %s",
-                self.url,
-                e,
-            )
-            raise DownloadFailed(
-                f"Download failed for {self.url}: {e}"
-            ) from e
+        return await self.core.legacy_download(
+            url=url,
+            configuration=config,
+        )
 
     async def get_authors(
         self,
@@ -394,7 +336,7 @@ class BaseProfile(BaseMedia):
     loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
 
     async def _load_html(self) -> dict[str, object]:
-        html_content = await get_html_content(url=self.url, core=self.core)
+        html_content = await get_html_content(url=self.url, core=self.core, owner=self)
         assert isinstance(html_content, str)
         return await asyncio.to_thread(self._extract_html, html_content)
 
