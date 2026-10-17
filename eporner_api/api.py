@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+from functools import partial
 import json
 import logging
 import asyncio
 import argparse
 
 from eporner_api.modules import errors as provider_errors
+from base_api import append_url_path, profile_base_url, replace_url_path
+from urllib.parse import urlsplit
 from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
 from base_api.modules.logger import configure_app_logging, get_logger
 
@@ -123,9 +126,12 @@ class Video(BaseMedia):
         if self.video_id is not None:
             return
 
-        match = re.search(r"(?:video-|hd-porn/)([^/]+)", self.url)
+        path = urlsplit(self.url).path
+        match = re.match(r"/(?:video-|hd-porn/|embed/)([A-Za-z0-9]+)(?:/|$)", path)
         if match:
             self.video_id = match.group(1)
+        if path.startswith("/embed/") and self.video_id:
+            self.url = replace_url_path(self.url, f"/video-{self.video_id}/")
 
     async def _load_api(self) -> dict[str, object]:
         url = (
@@ -325,6 +331,10 @@ class Video(BaseMedia):
 
 @dataclass(kw_only=True, slots=True)
 class BaseProfile(BaseMedia):
+
+    def __post_init__(self):
+        profile_base_url(self.url, depth=2)
+
     core: BaseCore
     name: str | None = media_field("html")
     subscribers: str | None = media_field("html")
@@ -332,13 +342,20 @@ class BaseProfile(BaseMedia):
     video_views: str | None = media_field("html")
     picture: str | None = media_field("html")
     websites: dict[str, str] | None = media_field("html")
+    total_pages: int | None = media_field("html")
 
     loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
 
     async def _load_html(self) -> dict[str, object]:
         html_content = await get_html_content(url=self.url, core=self.core, owner=self)
         assert isinstance(html_content, str)
-        return await asyncio.to_thread(self._extract_html, html_content)
+        data = await asyncio.to_thread(self._extract_html, html_content)
+        base_path = urlsplit(profile_base_url(self.resolved_url or self.url)).path
+        parser = LexborHTMLParser(html_content)
+        numbers = [int(match.group(1)) for node in parser.css("a[href]")
+                   if (match := re.fullmatch(re.escape(base_path) + r"/(\d+)/?", urlsplit(node.attributes["href"]).path))]
+        data["total_pages"] = max(numbers, default=1)
+        return data
 
     @staticmethod
     def _extract_html(html_content: str) -> dict[str, object]:
@@ -350,24 +367,19 @@ class BaseProfile(BaseMedia):
         iterator_config: IteratorConfig | None = None,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
         if pages == 0:
-            raw_video_amount = await self.get_field("video_amount")
-            try:
-                cleaned_amount = int(str(raw_video_amount or "0").replace(",", ""))
-                pages = max(1, (cleaned_amount + 36) // 37)  # One page contains 37 videos
-            except (ValueError, TypeError):
-                pages = 1
+            pages = await self.get_field("total_pages") or 1
 
         helper = Helper(core=self.core, constructor=Video)
         pages = round(pages)
-        url = self.url
-        page_urls = [urljoin(f"{url}/", str(page)) for page in range(1, pages + 1)]
+        url = profile_base_url(self.resolved_url or self.url)
+        page_urls = [append_url_path(url, page) for page in range(1, pages + 1)]
 
         if iterator_config is None:
             iterator_config = make_iterator_config()
 
         stream = helper.iterator(
             target_page_urls=page_urls,
-            item_extractor=extractor,
+            item_extractor=partial(extractor, base_url=url),
             iterator_config=iterator_config,
         )
         async with stream:

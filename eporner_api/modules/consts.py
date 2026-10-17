@@ -1,4 +1,5 @@
 import re
+from urllib.parse import urljoin, urlsplit
 import json
 from selectolax.lexbor import LexborHTMLParser
 
@@ -15,7 +16,7 @@ headers = {
 }
 
 
-def extractor(content: str) -> list[dict]:
+def extractor(content: str, base_url: str = ROOT_URL) -> list[dict]:
     videos_data = []
     lexbor = LexborHTMLParser(content)
     # Target individual video block containers
@@ -31,7 +32,8 @@ def extractor(content: str) -> list[dict]:
         if not isinstance(url, str) or not url:
             continue
 
-        match_id = re.search(r"(?:video-|hd-porn/)([^/]+)", url)
+        url = urljoin(base_url, url)
+        match_id = re.search(r"(?:video-|hd-porn/)([^/]+)", urlsplit(url).path)
         if match_id:
             video_id = match_id.group(1)
 
@@ -85,11 +87,11 @@ def extractor(content: str) -> list[dict]:
         if uploader_node:
             author_href = uploader_node.attributes.get("href")
             if author_href:
-                authors_urls = [author_href]
+                authors_urls = [urljoin(base_url, author_href)]
 
         # Unknown author data stays omitted so BaseMedia can load it from HTML.
         video_data = {
-            "url": f"https://eporner.com{url}",
+            "url": url,
             "video_id": video_id,
             "title": title,
             "views": views,
