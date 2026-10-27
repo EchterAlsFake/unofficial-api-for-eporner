@@ -36,7 +36,7 @@ async def test_search_4(client):
 
 @pytest.mark.asyncio
 async def test_search_5(client):
-    videos = client.search_videos(query, pages=pages, per_page=per_page, sorting_order=Gay.include_gay_content, sorting_gay=Order.top_weekly, sorting_low_quality=LowQuality.include_low_quality_content)
+    videos = client.search_videos(query, pages=pages, per_page=per_page, sorting_gay=Gay.include_gay_content, sorting_order=Order.top_weekly, sorting_low_quality=LowQuality.include_low_quality_content)
     async for result in videos:
         assert len(result.unwrap().title) > 0
 

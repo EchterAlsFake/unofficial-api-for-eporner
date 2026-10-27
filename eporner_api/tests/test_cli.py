@@ -73,7 +73,7 @@ class TestCLI(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_download(self):
         """Integration test: verifies real video download via CLI."""
-        url = "https://www.eporner.com/video-pDRNfJoN7dN/granny-with-young-guy/"
+        url = "https://www.eporner.com/video-2MWhVhhsAfM/zz-olenade/"
         with tempfile.TemporaryDirectory() as tmp_dir:
             await run_main(["--download", url, "--output", tmp_dir, "--quality", "worst"])
             files = [f for f in os.listdir(tmp_dir) if not f.endswith(".tmp")]

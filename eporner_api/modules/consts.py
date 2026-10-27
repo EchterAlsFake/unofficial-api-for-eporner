@@ -60,10 +60,10 @@ def extractor(content: str, base_url: str = ROOT_URL) -> list[dict]:
             try:
                 if len(time_parts) == 2:  # MM:SS
                     length_minutes = time_parts[0]
-                    length_seconds = str(int(time_parts[0]) * 60 + int(time_parts[1]))
+                    length_seconds = int(time_parts[0]) * 60 + int(time_parts[1])
                 elif len(time_parts) == 3:  # HH:MM:SS
                     length_minutes = str(int(time_parts[0]) * 60 + int(time_parts[1]))
-                    length_seconds = str(int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2]))
+                    length_seconds = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
             except ValueError:
                 pass  # Keep as None if parsing fails due to bad strings
 
@@ -116,17 +116,17 @@ def extractor_json(content: str) -> list[dict]:
         url = video.get("url")
         if not isinstance(url, str) or not url:
             continue
-        video_id = video.get("video_id")
+        video_id = video.get("id") or video.get("video_id")
         title = video.get("title")
-        keywords = video.get("keywords")
+        keywords = [word.strip() for word in (video.get("keywords") or "").split(",") if word.strip()]
         views = video.get("views")
         rate = video.get("rate")
         publish_date = video.get("added")
         length_seconds = video.get("length_sec")
         length_minutes = video.get("length_min")
-        embed_url = video.get("embed_url")
-        thumbnail = video.get("default_thumb").get("src")
-        thumbnails = video.get("thumbs")
+        embed_url = video.get("embed") or video.get("embed_url")
+        thumbnail = (video.get("default_thumb") or {}).get("src")
+        thumbnails = [thumb["src"] for thumb in (video.get("thumbs") or []) if thumb.get("src")]
 
         videos.append({
             "url": url,

@@ -9,7 +9,7 @@ import argparse
 
 from eporner_api.modules import errors as provider_errors
 from base_api import append_url_path, profile_base_url, replace_url_path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
 from base_api.modules.logger import configure_app_logging, get_logger
 
@@ -127,10 +127,10 @@ class Video(BaseMedia):
             return
 
         path = urlsplit(self.url).path
-        match = re.match(r"/(?:video-|hd-porn/|embed/)([A-Za-z0-9]+)(?:/|$)", path)
+        match = re.match(r"/(?:video-|hd-porn/|embed/|porno-video/)([A-Za-z0-9]+)(?:/|$)", path)
         if match:
             self.video_id = match.group(1)
-        if path.startswith("/embed/") and self.video_id:
+        if path.startswith(("/embed/", "/porno-video/")) and self.video_id:
             self.url = replace_url_path(self.url, f"/video-{self.video_id}/")
 
     async def _load_api(self) -> dict[str, object]:
@@ -169,10 +169,10 @@ class Video(BaseMedia):
             "length_seconds": json_data.get("length_sec"),
             "length_minutes": json_data.get("length_min"),
             "embed_url": json_data.get("embed"),
-            "thumbnail": json_data.get("default_thumb", {}).get("src"),
+            "thumbnail": (json_data.get("default_thumb") or {}).get("src"),
             "thumbnails": [
                 thumb["src"]
-                for thumb in json_data.get("thumbs", [])
+                for thumb in (json_data.get("thumbs") or [])
                 if thumb.get("src")
             ],
         }
@@ -190,15 +190,30 @@ class Video(BaseMedia):
         json_html = None
 
         for script in lexbor.css("script[type='application/ld+json']"):
-            data = json.loads(script.text(), strict=False)
-            if data.get("@type") == "VideoObject":
-                json_html = data
+            try:
+                data = json.loads(script.text(), strict=False)
+            except (ValueError, TypeError):
+                continue
+            candidates = data if isinstance(data, list) else [data]
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                for candidate in [item, *item.get("@graph", [])]:
+                    if isinstance(candidate, dict) and "VideoObject" in (
+                        candidate.get("@type") if isinstance(candidate.get("@type"), list)
+                        else [candidate.get("@type")]
+                    ):
+                        json_html = candidate
+                        break
+                if json_html is not None:
+                    break
+            if json_html is not None:
                 break
 
         if json_html is None:
             raise ValueError("Video metadata was not found in the page")
 
-        rating = json_html.get("aggregateRating", {})
+        rating = json_html.get("aggregateRating") or {}
 
         categories = [
             node.text(strip=True)
@@ -209,10 +224,13 @@ class Video(BaseMedia):
             for node in lexbor.css("li.vit-tag")
         ]
 
+        actors = json_html.get("actor") or []
+        if isinstance(actors, dict):
+            actors = [actors]
         authors_urls = [
             actor["url"]
-            for actor in json_html.get("actor", [])
-            if actor.get("url")
+            for actor in actors
+            if isinstance(actor, dict) and actor.get("url")
         ]
 
         raw_data = {}
@@ -228,9 +246,7 @@ class Video(BaseMedia):
                     continue
 
                 quality = int(match.group(1))
-                raw_data.setdefault(quality, {})[mode] = (
-                    f"https://www.eporner.com{href}"
-                )
+                raw_data.setdefault(quality, {})[mode] = urljoin(ROOT_URL, href)
 
         parsed_urls = {
             f"{quality}p": {
@@ -240,7 +256,9 @@ class Video(BaseMedia):
             for quality, urls in sorted(raw_data.items())
         }
 
-        thumbnails = json_html.get("thumbnailUrl", [])
+        thumbnails = json_html.get("thumbnailUrl") or []
+        if isinstance(thumbnails, str):
+            thumbnails = [thumbnails]
 
         return {
             "title": json_html.get("name"),
@@ -275,14 +293,15 @@ class Video(BaseMedia):
         quality: str | int,
         mode: Encoding | str,
     ) -> str:
-        available = self.video_qualities()
+        if isinstance(mode, Encoding):
+            mode = mode.value
+        available = [quality for quality, urls in (self.parsed_urls or {}).items() if urls.get(mode)]
+        if not available:
+            raise ValueError(f"No download URLs for encoding={mode!r}: {self.url}")
         quality = choose_quality_from_list(
             available=available,
             target=normalize_quality_value(quality),
         )
-
-        if isinstance(mode, Encoding):
-            mode = mode.value
 
         url = self.parsed_urls[f"{quality}p"].get(mode)
         if url:
@@ -350,6 +369,9 @@ class BaseProfile(BaseMedia):
         html_content = await get_html_content(url=self.url, core=self.core, owner=self)
         assert isinstance(html_content, str)
         data = await asyncio.to_thread(self._extract_html, html_content)
+        error = LexborHTMLParser(html_content).css_first("#error")
+        if error and error.text(strip=True):
+            raise NotFound(error.text(strip=True))
         base_path = urlsplit(profile_base_url(self.resolved_url or self.url)).path
         parser = LexborHTMLParser(html_content)
         numbers = [int(match.group(1)) for node in parser.css("a[href]")
@@ -447,15 +469,15 @@ class Pornstar(BaseProfile):
                 text = d.text(strip=True).lower()
                 span = d.css_first("span")
                 val = span.text(strip=True) if span else None
-                if "rank:" in text:
+                if any(label in text for label in ("rank:", "rang:")):
                     pornstar_rank = val
-                elif "profile views:" in text:
+                elif any(label in text for label in ("profile views:", "profilansichten:", "vues du profil:")):
                     profile_views = val
-                elif "video views:" in text:
+                elif any(label in text for label in ("video views:", "videos:", "vues vidéo:")):
                     video_views = val
-                elif "photo views:" in text:
+                elif any(label in text for label in ("photo views:", "fotoansichten:", "vues photo:")):
                     photo_views = val
-                elif "subscribers:" in text:
+                elif any(label in text for label in ("subscribers:", "abonnenten:", "abonnés:")):
                     subscribers = val
 
         if subscribers is None:
@@ -475,6 +497,17 @@ class Pornstar(BaseProfile):
                 val_node = li.css_first("div.cllnumber")
                 if label_node and val_node:
                     ps2_map[label_node.text(strip=True).rstrip(":").lower()] = val_node.text(strip=True)
+
+        aliases = {
+            "land": "country", "pays": "country", "alter": "age", "âge": "age",
+            "ethnische erscheinung": "ethnicity", "ethnicité": "ethnicity",
+            "auge": "eye", "œil": "eye", "haare": "hair", "cheveux": "hair",
+            "höhe": "height", "la taille": "height", "gewicht": "weight", "poids": "weight",
+            "die tasse": "cup", "maße": "measurements", "des mesures": "measurements",
+        }
+        for label, canonical in aliases.items():
+            if label in ps2_map:
+                ps2_map.setdefault(canonical, ps2_map[label])
 
         country = ps2_map.get("country")
         age = ps2_map.get("age")
@@ -576,13 +609,13 @@ class Channel(BaseProfile):
                 span = d.css_first("span")
                 val = span.text(strip=True) if span else None
                 text = d.text(strip=True).lower()
-                if "subscriber" in text:
+                if any(label in text for label in ("subscriber", "abonnenten", "abonnés")):
                     subscribers = val
-                elif "video" in text and "view" not in text:
+                elif any(label in text for label in ("video", "vidéo")) and "view" not in text:
                     video_amount = val
-                elif "view" in text:
+                elif any(label in text for label in ("view", "ansichten", "vues")):
                     video_views = val
-                elif "rank" in text:
+                elif "rank" in text or "rang" in text:
                     channel_rank = val
 
         if subscribers is None and sub_btn:
@@ -656,14 +689,24 @@ class Client:
     def search_videos(
         self,
         query: str,
-        sorting_gay: str | Gay,
-        sorting_order: str | Order,
-        sorting_low_quality: str | LowQuality,
-        per_page: int,
+        sorting_gay: str | Gay = Gay.include_gay_content,
+        sorting_order: str | Order = Order.latest,
+        sorting_low_quality: str | LowQuality = LowQuality.include_low_quality_content,
+        per_page: int = 30,
         pages: int = 2,
         iterator_config: IteratorConfig | None = None,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
-        page_urls = [f"{ROOT_URL}{API_SEARCH}?query={query}&per_page={per_page}&%page={page}&thumbsize=medium&order={sorting_order}&gay={sorting_gay}&lq={sorting_low_quality}&format=json" for page in range(pages)]
+        sorting_gay = Gay(sorting_gay)
+        sorting_order = Order(sorting_order)
+        sorting_low_quality = LowQuality(sorting_low_quality)
+        if not 1 <= per_page <= 1000:
+            raise ValueError("per_page must be between 1 and 1000")
+        if pages < 1:
+            raise ValueError("pages must be positive")
+        page_urls = [f"{ROOT_URL}{API_SEARCH}?" + urlencode({
+            "query": query, "per_page": per_page, "page": page, "thumbsize": "medium",
+            "order": sorting_order, "gay": sorting_gay, "lq": sorting_low_quality, "format": "json",
+        }) for page in range(1, pages + 1)]
 
         if iterator_config is None:
             iterator_config = make_iterator_config()
@@ -759,30 +802,33 @@ async def run_main(args_list: list[str] | None = None):
         parser.print_help()
         return
 
-    client = Client()
-    for url in urls:
-        if console:
-            console.print(f"[cyan]Fetching video information for:[/cyan] [yellow]{url}[/yellow]")
-        else:
-            print(f"Fetching video information for: {url}")
-        try:
-            video = await client.get_video(url, load_html=True)
-            title = getattr(video, "title", None) or url
+    async with BaseCore(RuntimeConfig()) as core:
+        client = Client(core=core)
+        for url in urls:
             if console:
-                console.print(f"[green]Starting download for:[/green] [bold]{title}[/bold]")
+                console.print(f"[cyan]Fetching video information for:[/cyan] [yellow]{url}[/yellow]")
             else:
-                print(f"Starting download for: {title}")
-            await video.download(config, mode=Encoding.mp4_h264)
-            if console:
-                console.print(f"[bold green]Download complete: {title}![/bold green]")
-            else:
-                print(f"Download complete: {title}")
-        except Exception as e:
-            logger.exception("CLI failed while processing %s", url)
-            if console:
-                console.print(f"[bold red]Error downloading {url}:[/bold red] {e}")
-            else:
-                print(f"Error downloading {url}: {e}")
+                print(f"Fetching video information for: {url}")
+            try:
+                video = await client.get_video(url, load_html=True)
+                title = getattr(video, "title", None) or url
+                if console:
+                    console.print(f"[green]Starting download for:[/green] [bold]{title}[/bold]")
+                else:
+                    print(f"Starting download for: {title}")
+                result = await video.download(config, mode=Encoding.mp4_h264)
+                if result is False or getattr(result, "status", None) == "failed":
+                    raise DownloadFailed("Download did not complete")
+                if console:
+                    console.print(f"[bold green]Download complete: {title}![/bold green]")
+                else:
+                    print(f"Download complete: {title}")
+            except Exception as e:
+                logger.exception("CLI failed while processing %s", url)
+                if console:
+                    console.print(f"[bold red]Error downloading {url}:[/bold red] {e}")
+                else:
+                    print(f"Error downloading {url}: {e}")
 
 
 def main():

@@ -5,7 +5,7 @@ from ..api import Client, Encoding
 
 @pytest.mark.asyncio
 async def test_video():
-    url = "https://www.eporner.com/video-pDRNfJoN7dN/granny-with-young-guy/"
+    url = "https://www.eporner.com/video-2MWhVhhsAfM/zz-olenade/"
     video = await Client().get_video(url, load_html=True, load_api=True)
     assert isinstance(video.title, str) and len(video.title) > 0
     assert isinstance(video.video_id, str) and len(video.video_id) > 0

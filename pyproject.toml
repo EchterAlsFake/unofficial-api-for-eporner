@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "unofficial-api-for-eporner"
-version = "2.4.3"
+version = "2.5.3"
 description = "An asynchronous Python API wrapper and scraper for Eporner.com"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
@@ -26,7 +26,7 @@ keywords = [
 ]
 dependencies = [
     "selectolax",
-    "eaf-base-api>=4.2.2",
+    "eaf-base-api>=4.2.5",
     "curl-cffi",
 ]
 
