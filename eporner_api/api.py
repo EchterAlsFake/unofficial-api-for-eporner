@@ -113,6 +113,7 @@ class Video(BaseMedia):
     best_rating: str | None = media_field("html")
     worst_rating: str | None = media_field("html")
     authors_urls: list[str] | None = media_field("html")
+    performers: list[dict] | None = media_field("html")
     tags: list[str] | None = media_field("html")
     categories: list[str] | None = media_field("html")
     uploader: str | None = media_field("html")
@@ -278,6 +279,8 @@ class Video(BaseMedia):
             "content_url": json_html.get("contentUrl"),
             "parsed_urls": parsed_urls,
             "authors_urls": authors_urls,
+            "performers": [{"name": actor["name"], "url": actor.get("url")} for actor in actors
+                           if isinstance(actor, dict) and actor.get("name")],
             "categories": categories,
             "tags": tags,
             "uploader": get_text_safe(

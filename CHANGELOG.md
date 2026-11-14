@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.5.4 - 2026-11-14
+
+- Retain scene actor names and URLs together for metadata export without extra profile requests.
+
 ## 2.5.3 — 2026-10-27
 
 - Fix search pagination so later pages no longer repeat page one. Search queries now preserve reserved characters and Unicode.
