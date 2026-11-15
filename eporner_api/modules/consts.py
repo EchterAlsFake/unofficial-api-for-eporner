@@ -20,7 +20,10 @@ def extractor(content: str, base_url: str = ROOT_URL) -> list[dict]:
     videos_data = []
     lexbor = LexborHTMLParser(content)
     # Target individual video block containers
-    video_nodes = lexbor.css("div.mb")
+    region = lexbor.css_first("#vidresults")
+    if region is None:
+        raise ValueError("Expected Eporner listing region missing")
+    video_nodes = region.css("div.mb")
 
     for node in video_nodes:
         video_id = node.attributes.get("data-id")

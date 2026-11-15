@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from base_api import paginated_stream, PageInfo, validate_pagination
+from base_api.modules.pagination import linked_page, http_status_is
+
 import re
 from functools import partial
 import json
@@ -375,41 +378,53 @@ class BaseProfile(BaseMedia):
         error = LexborHTMLParser(html_content).css_first("#error")
         if error and error.text(strip=True):
             raise NotFound(error.text(strip=True))
-        base_path = urlsplit(profile_base_url(self.resolved_url or self.url)).path
         parser = LexborHTMLParser(html_content)
-        numbers = [int(match.group(1)) for node in parser.css("a[href]")
-                   if (match := re.fullmatch(re.escape(base_path) + r"/(\d+)/?", urlsplit(node.attributes["href"]).path))]
-        data["total_pages"] = max(numbers, default=1)
+        # Numbered links are a moving window, not the total. Only an explicit
+        # last-page control can establish a bound before traversing the listing.
+        last = parser.css_first('a[rel="last"][href]')
+        match = (
+            re.search(r"/([0-9]+)/?$", urlsplit(last.attributes["href"]).path)
+            if last
+            else None
+        )
+        data["total_pages"] = int(match[1]) if match else None
         return data
 
     @staticmethod
     def _extract_html(html_content: str) -> dict[str, object]:
         raise NotImplementedError
 
-    async def videos(
+    def videos(
         self,
-        pages: int = 0,
+        pages: int | str = 1,
         iterator_config: IteratorConfig | None = None,
+        *,
+        start_page: int = 1,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
-        if pages == 0:
-            pages = await self.get_field("total_pages") or 1
-
-        helper = Helper(core=self.core, constructor=Video)
-        pages = round(pages)
+        validate_pagination(pages, start_page)
         url = profile_base_url(self.resolved_url or self.url)
-        page_urls = [append_url_path(url, page) for page in range(1, pages + 1)]
-
+        page_url = lambda page: (
+            url.rstrip("/") + "/"
+            if page == 1
+            else append_url_path(url, page).rstrip("/") + "/"
+        )
         if iterator_config is None:
             iterator_config = make_iterator_config()
-
-        stream = helper.iterator(
-            target_page_urls=page_urls,
+        stream = paginated_stream(
             item_extractor=partial(extractor, base_url=url),
             iterator_config=iterator_config,
+            core=self.core,
+            constructor=Video,
+            page_url=page_url,
+            pages=pages,
+            start_page=start_page,
+            page_info=lambda content, page, rows: _pagination_info(
+                content, page, rows, page_url=page_url
+            ),
+            verify_first=True,
+            terminal_error=lambda error, page: page > 1 and http_status_is(error, 404),
         )
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        return stream
 
 
 @dataclass(kw_only=True, slots=True)
@@ -696,51 +711,66 @@ class Client:
         sorting_order: str | Order = Order.latest,
         sorting_low_quality: str | LowQuality = LowQuality.include_low_quality_content,
         per_page: int = 30,
-        pages: int = 2,
+        pages: int | str = 1,
         iterator_config: IteratorConfig | None = None,
+        *,
+        start_page: int = 1,
     ) -> AsyncGenerator[ScrapeResult[Video], None]:
+        validate_pagination(pages, start_page)
         sorting_gay = Gay(sorting_gay)
         sorting_order = Order(sorting_order)
         sorting_low_quality = LowQuality(sorting_low_quality)
         if not 1 <= per_page <= 1000:
             raise ValueError("per_page must be between 1 and 1000")
-        if pages < 1:
-            raise ValueError("pages must be positive")
-        page_urls = [f"{ROOT_URL}{API_SEARCH}?" + urlencode({
-            "query": query, "per_page": per_page, "page": page, "thumbsize": "medium",
-            "order": sorting_order, "gay": sorting_gay, "lq": sorting_low_quality, "format": "json",
-        }) for page in range(1, pages + 1)]
-
+        page_url = lambda page: (
+            f"{ROOT_URL}{API_SEARCH}?"
+            + urlencode(
+                {
+                    "query": query,
+                    "per_page": per_page,
+                    "page": page,
+                    "thumbsize": "medium",
+                    "order": sorting_order,
+                    "gay": sorting_gay,
+                    "lq": sorting_low_quality,
+                    "format": "json",
+                }
+            )
+        )
         if iterator_config is None:
             iterator_config = make_iterator_config()
-
-        return scrape_stream(
+        return paginated_stream(
             core=self.core,
             constructor=Video,
-            target_page_urls=page_urls,
             item_extractor=extractor_json,
             iterator_config=iterator_config,
+            page_url=page_url,
+            pages=pages,
+            start_page=start_page,
+            page_info=lambda content, page, rows: _pagination_info(
+                content, page, rows, page_url=page_url
+            ),
+            verify_first=True,
+            terminal_error=lambda error, page: page > 1 and http_status_is(error, 404),
         )
-
 
     def get_videos_by_category(
-        self,
-        category: str | Category,
-        iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult[Video], None]:
-        page_urls = [f"{ROOT_URL}cat/{category}/{page}" for page in range(1, 100)]
-
-        if iterator_config is None:
-            iterator_config = make_iterator_config()
-
-        return scrape_stream(
+        self, category: str | Category, iterator_config=None, *, pages=1, start_page=1
+    ):
+        validate_pagination(pages, start_page)
+        page_url = lambda page: f"{ROOT_URL}cat/{category}/{page}/"
+        return paginated_stream(
             core=self.core,
             constructor=Video,
-            target_page_urls=page_urls,
+            page_url=page_url,
             item_extractor=extractor,
+            pages=pages,
+            start_page=start_page,
+            page_info=lambda content, page, rows: _pagination_info(
+                content, page, rows, page_url=page_url
+            ),
             iterator_config=iterator_config,
         )
-
 
     async def get_pornstar(self, url: str, load_html: bool = True) -> Pornstar:
         logger.info(f"Returning Pornstar object for: {url} HTML Scraping -> {load_html}")
@@ -755,6 +785,17 @@ class Client:
         if load_html:
             await channel.load_sources("html")
         return channel
+
+
+def _pagination_info(content, page, rows, *, page_url):
+    if str(content).lstrip().startswith("{"):
+        data = json.loads(content)
+        return PageInfo(
+            current_page=int(data["page"]),
+            total_pages=int(data["total_pages"]),
+            terminal=not rows,
+        )
+    return linked_page(content, page, rows, page_url=page_url)
 
 
 def create_parser(formatter_class=None) -> argparse.ArgumentParser:
@@ -844,3 +885,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
